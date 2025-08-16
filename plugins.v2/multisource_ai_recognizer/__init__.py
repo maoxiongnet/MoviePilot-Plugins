@@ -260,7 +260,7 @@ class Scorer:
         return bd
 
 # ========= 插件主体 =========
-class MultisourceAIRecognizer(PluginBase):
+class Multisource_Ai_Recognizer(PluginBase)::
     plugin_name = "多源AI识别与评分"
     plugin_desc = "LLM + Douban/Trakt/Bangumi/TMDB 多源互证；积分制（可>100）；低分入人工队列并支持自选目录/自动下载"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png"
