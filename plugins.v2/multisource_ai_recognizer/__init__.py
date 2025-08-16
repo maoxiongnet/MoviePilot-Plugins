@@ -432,106 +432,181 @@ class Multisource_Ai_Recognizer(PluginBase)::
         # < th_manual ：不处理（交由其它插件/主程序）
 
     # ===== 页面：人工队列 + 批量AI + 🧪自检 =====
-    def get_page(self) -> Optional[dict]:
-        rows = []
-        with self._lock:
-            for k, v in self._queue.items():
-                rows.append({
-                    "id": k,
-                    "title": v.get("title"),
-                    "name": (v.get("ai") or {}).get("name"),
-                    "year": (v.get("ai") or {}).get("year"),
-                    "score": (v.get("score") or {}).get("total", 0),
-                })
+   def get_page(self) -> Optional[dict]:
+    """
+    人工队列页面（保险版）
+    - 顶部：批量AI按钮 / 自检按钮 / 模式切换
+    - 中部：目标存储与路径输入（不依赖弹窗，更稳）
+    - 表格：待确认条目 + 行内“确认并整理”按钮
+    - 自检日志：若有结果则在底部展示
+    """
+    rows = []
+    # 将内存中的队列转成表格数据
+    with self._lock:
+        for k, v in self._queue.items():
+            rows.append({
+                "id": k,
+                "title": v.get("title"),
+                "name": (v.get("ai") or {}).get("name"),
+                "year": (v.get("ai") or {}).get("year"),
+                "score": (v.get("score") or {}).get("total", 0),
+            })
 
-        # 自检日志展示
-        logs_block = []
-        if self._selftest:
-            txt = "\n".join(self._selftest.get("logs", [])) or "（无日志）"
-            ok = bool(self._selftest.get("ok"))
-            logs_block = [{
-                "element": "v-alert",
-                "props": {"type": "success" if ok else "error", "text": True},
-                "children": [f"🧪 自检结果：{'通过' if ok else '存在问题'}"],
-            }, {
-                "element": "v-card", "children": [
-                    {"element": "v-card-title", "children": ["自检日志"]},
-                    {"element": "v-card-text", "children": [txt]}
+    # 顶部控制区：批量AI、自检、模式切换
+    top_controls = {
+        "element": "v-row",
+        "children": [
+            {
+                "element": "v-col",
+                "props": {"cols": 12, "md": 6},
+                "children": [
+                    {
+                        "element": "v-btn",
+                        "props": {"color": "primary", "class": "mr-2"},
+                        "events": {"click": {
+                            "api": "plugin/multisource_ai_recognizer/ai_batch",
+                            "method": "post",
+                            "json": {"scope": "all"}
+                        }},
+                        "children": ["🤖 AI识别（全部）"]
+                    },
+                    {
+                        "element": "v-btn",
+                        "props": {"color": "primary", "class": "mr-2"},
+                        "events": {"click": {
+                            "api": "plugin/multisource_ai_recognizer/ai_batch",
+                            "method": "post",
+                            "json": {"scope": "selected", "ids": "{{selectedIds}}"}
+                        }},
+                        "children": ["🤖 AI识别（所选）"]
+                    },
+                    {
+                        "element": "v-btn",
+                        "props": {"color": "secondary"},
+                        "events": {"click": {
+                            "api": "plugin/multisource_ai_recognizer/selftest",
+                            "method": "post"
+                        }},
+                        "children": ["🧪 自检"]
+                    }
                 ]
-            }]
-
-        return {
-            "element": "v-container",
-            "props": {"fluid": True},
-            "children": [
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12, "md": 6}, "children": [
-                        {"element": "v-btn", "props": {"color": "primary", "class": "mr-2"},
-                         "events": {"click": {"api": "plugin/multisource_ai_recognizer/ai_batch", "method": "post", "json": {"scope": "all"}}},
-                         "children": ["🤖 AI识别（全部）"]},
-                        {"element": "v-btn", "props": {"color": "primary", "class": "mr-2"},
-                         "events": {"click": {"api": "plugin/multisource_ai_recognizer/ai_batch", "method": "post", "json": {"scope": "selected", "ids": "{{selectedIds}}"}}},
-                         "children": ["🤖 AI识别（所选）"]},
-                        {"element": "v-btn", "props": {"color": "secondary"},
-                         "events": {"click": {"api": "plugin/multisource_ai_recognizer/selftest", "method": "post"}},
-                         "children": ["🧪 自检"]}
-                    ]},
-                    {"element": "v-col", "props": {"cols": 12, "md": 6}, "children": [
-                        {"element": "v-select", "props": {
-                            "label": "AI触发模式", "model": "ask_mode",
-                            "items": [{"title": "智能(smart)", "value": "smart"},
-                                      {"title": "总是(always)", "value": "always"},
-                                      {"title": "手动(manual)", "value": "manual"}],
+            },
+            {
+                "element": "v-col",
+                "props": {"cols": 12, "md": 6},
+                "children": [
+                    {
+                        # 触发模式切换：smart / always / manual
+                        "element": "v-select",
+                        "props": {
+                            "label": "AI触发模式",
+                            "model": "ask_mode",
+                            "items": [
+                                {"title": "智能(smart)", "value": "smart"},
+                                {"title": "总是(always)", "value": "always"},
+                                {"title": "手动(manual)", "value": "manual"}
+                            ],
                             "value": self._cfg.get("ask_mode", "smart")
                         },
-                         "events": {"change": {"api": "plugin/multisource_ai_recognizer/config", "method": "post", "json": {"ask_mode": "{{ask_mode}}"}}}
-                        }
-                    ]}
-                ]},
-                # 目标目录输入（稳妥，不依赖弹窗）
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12, "md": 4}, "children": [
-                        {"element": "v-text-field", "props": {"label": "目标存储类型", "model": "target_storage", "placeholder": "local/nas/..."}}
-                    ]},
-                    {"element": "v-col", "props": {"cols": 12, "md": 8}, "children": [
-                        {"element": "v-text-field", "props": {"label": "目标目录路径", "model": "target_path", "placeholder": "/media/Movies"}}
-                    ]}
-                ]},
-                # 队列表
-                {"element": "v-data-table",
-                 "props": {
-                    "items": rows,
-                    "show-select": True,
-                    "showSelect": True,
-                    "model": "selectedIds",
-                    "headers": [
-                        {"title": "ID", "value": "id"},
-                        {"title": "标题", "value": "title"},
-                        {"title": "名称", "value": "name"},
-                        {"title": "年份", "value": "year"},
-                        {"title": "得分", "value": "score"},
-                        {"title": "操作", "value": "actions"}
-                    ],
-                    "item": {
-                        "actions": {
-                            "element": "v-btn",
-                            "props": {"text": True, "color": "primary"},
-                            "events": {"click": {
-                                "api": "plugin/multisource_ai_recognizer/confirm",
-                                "method": "post",
-                                "json": {"id": "{{item.id}}",
-                                         "target_storage": "{{target_storage}}",
-                                         "target_path": "{{target_path}}"}
-                            }},
-                            "children": ["确认并整理"]
-                        }
+                        "events": {"change": {
+                            "api": "plugin/multisource_ai_recognizer/config",
+                            "method": "post",
+                            "json": {"ask_mode": "{{ask_mode}}"}
+                        }}
                     }
-                 }
-                },
-                # 自检日志块（如有）
-                *logs_block
-            ]
+                ]
+            }
+        ]
+    }
+
+    # 目标目录输入（不依赖弹窗，兼容更好）
+    target_inputs = {
+        "element": "v-row",
+        "children": [
+            {
+                "element": "v-col",
+                "props": {"cols": 12, "md": 4},
+                "children": [
+                    {"element": "v-text-field",
+                     "props": {"label": "目标存储类型", "model": "target_storage", "placeholder": "local/nas/..."}}
+                ]
+            },
+            {
+                "element": "v-col",
+                "props": {"cols": 12, "md": 8},
+                "children": [
+                    {"element": "v-text-field",
+                     "props": {"label": "目标目录路径", "model": "target_path", "placeholder": "/media/Movies"}}
+                ]
+            }
+        ]
+    }
+
+    # 队列数据表：每行“确认并整理”会把当前顶部输入一起提交
+    table = {
+        "element": "v-data-table",
+        "props": {
+            "items": rows,
+            "show-select": True,      # 部分版本是 showSelect，这里两个都给
+            "showSelect": True,
+            "model": "selectedIds",   # 勾选的ID数组，供“所选AI识别”使用
+            "headers": [
+                {"title": "ID", "value": "id"},
+                {"title": "标题", "value": "title"},
+                {"title": "名称", "value": "name"},
+                {"title": "年份", "value": "year"},
+                {"title": "得分", "value": "score"},
+                {"title": "操作", "value": "actions"}
+            ],
+            "item": {
+                "actions": {
+                    "element": "v-btn",
+                    "props": {"text": True, "color": "primary"},
+                    "events": {"click": {
+                        "api": "plugin/multisource_ai_recognizer/confirm",
+                        "method": "post",
+                        "json": {
+                            "id": "{{item.id}}",
+                            "target_storage": "{{target_storage}}",
+                            "target_path": "{{target_path}}"
+                        }
+                    }},
+                    "children": ["确认并整理"]
+                }
+            }
         }
+    }
+
+    # 页面 children 组装（避免 *logs_block 的星号解包）
+    children = [top_controls, target_inputs, table]
+
+    # 自检日志（若存在则渲染在底部；避免 f-string 内联判断）
+    if self._selftest:
+        ok_flag = bool(self._selftest.get("ok"))
+        logs_list = self._selftest.get("logs") or []
+        txt = "\n".join(logs_list) if logs_list else "（无日志）"
+        result_text = "🧪 自检结果：" + ("通过" if ok_flag else "存在问题")
+
+        children.append({
+            "element": "v-alert",
+            "props": {"type": "success" if ok_flag else "error", "text": True},
+            "children": [result_text]
+        })
+        children.append({
+            "element": "v-card",
+            "children": [
+                {"element": "v-card-title", "children": ["自检日志"]},
+                {"element": "v-card-text", "children": [txt]}
+            ]
+        })
+
+    # 返回页面 DSL
+    return {
+        "element": "v-container",
+        "props": {"fluid": True},
+        "children": children
+    }
+
 
     # ===== 页面 API =====
     def get_api(self) -> Optional[List[dict]]:
