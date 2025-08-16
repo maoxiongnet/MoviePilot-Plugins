@@ -1,12 +1,10 @@
 {
-  "plugins": [{
-    "name": "multisource_ai_recognizer",
-    "title": "多源AI识别与评分",
-    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png",
-    "version": "1.3.0",
-    "desc": "LLM+多源互证；积分制（可>100）；人工队列/批量AI/自检/自动下载",
-    "author": "chatgpt",
-    "homepage": "https://github.com/maoxiongnet/MoviePilot-Plugins",
-    "level": 2
-  }]
+  "name": "multisource_ai_recognizer",
+  "title": "多源AI识别与评分",
+  "version": "1.3.0",
+  "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png",
+  "desc": "LLM+多源互证；积分制（可>100）；人工队列/批量AI/自检/自动下载",
+  "author": "maoxiongnet",
+  "homepage": "https://github.com/maoxiongnet/MoviePilot-Plugins",
+  "level": 2
 }
