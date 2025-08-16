@@ -260,25 +260,28 @@ class Scorer:
         return bd
 
 # ========= 插件主体 =========
-class multisource_ai_recognizer(PluginBase):
+# ========= 插件主体 =========
+class Multisource_Ai_Recognizer(PluginBase):
+    """
+    多源AI识别与评分
+    - 这里只重写类名为带下划线的驼峰，便于与目录名/清单键名对齐
+    """
     plugin_name = "多源AI识别与评分"
     plugin_desc = "LLM + Douban/Trakt/Bangumi/TMDB 多源互证；积分制（可>100）；低分入人工队列并支持自选目录/自动下载"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"   # ← 同步到 package(.v2).json
 
     def __init__(self):
         super().__init__()
+        # 配置默认值（保持你原来的字段完整即可）
         self._cfg = {
-            # LLM
             "llm_base": "https://api.gptapi.us/v1",
             "llm_model": "deepseek-v3",
             "llm_key": "",
-            # MP 后端直连（可留空）
             "mp_api_base": "",
             "mp_api_token": "",
-            # 行为
-            "ask_mode": "smart",      # smart/always/manual
-            "auto_download": False,   # ≥阈值时自动下载
+            "ask_mode": "smart",           # smart/always/manual
+            "auto_download": False,        # ≥阈值自动下载
             "threshold_auto": THRESHOLD_AUTO_DEFAULT,
             "threshold_manual": THRESHOLD_MANUAL_DEFAULT,
             "weights": SCORE_WEIGHTS_DEFAULT,
