@@ -10,6 +10,7 @@ Multisource AI Recognizer for MoviePilot
 """
 
 from __future__ import annotations
+
 import json
 import re
 import time
@@ -24,6 +25,7 @@ import requests
 from app.core.event import eventmanager, Event, EventType, ChainEventType
 from app.core.plugin import PluginBase
 from app.log import logger
+
 
 # ========= 默认权重与阈值 =========
 SCORE_WEIGHTS_DEFAULT = {
@@ -52,16 +54,20 @@ SCORE_WEIGHTS_DEFAULT = {
 THRESHOLD_AUTO_DEFAULT = 120
 THRESHOLD_MANUAL_DEFAULT = 80
 
+
 # ========= 小工具 =========
 def _safe_int(x, default=None):
     try:
-        if x is None: return default
+        if x is None:
+            return default
         return int(x)
     except Exception:
         return default
 
+
 def _gen_id(n=8):
-    return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
 
 def _title_similarity(a: str, b: str) -> float:
     """
@@ -73,6 +79,7 @@ def _title_similarity(a: str, b: str) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / max(1, len(sa | sb))
+
 
 # ========= LLM 调用（仅 JSON 模式）=========
 class LLMClient:
@@ -93,7 +100,7 @@ class LLMClient:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"解析以下标题为JSON：{title}"}
+                {"role": "user", "content": f"解析以下标题为JSON：{title}"},
             ],
             "temperature": 0,
             "top_p": 0.1,
@@ -121,13 +128,14 @@ class LLMClient:
         i, j = text.find("{"), text.rfind("}")
         if i != -1 and j != -1 and j > i:
             try:
-                return json.loads(text[i:j+1])
+                return json.loads(text[i : j + 1])
             except Exception:
                 pass
         try:
             return json.loads(text)
         except Exception:
             return None
+
 
 # ========= MP 后端直连（可选）=========
 class MPClient:
@@ -137,15 +145,22 @@ class MPClient:
         self.timeout = timeout
 
     def _headers(self):
-        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"} if self.token else {"Content-Type": "application/json"}
+        return (
+            {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+            if self.token
+            else {"Content-Type": "application/json"}
+        )
 
     def recognize(self, title: str, subtitle: str = "") -> Optional[Dict[str, Any]]:
         if not self.base:
             return None
         try:
-            r = requests.get(f"{self.base}/api/v1/media/recognize",
-                             params={"title": title, "subtitle": subtitle},
-                             headers=self._headers(), timeout=self.timeout)
+            r = requests.get(
+                f"{self.base}/api/v1/media/recognize",
+                params={"title": title, "subtitle": subtitle},
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
@@ -156,9 +171,12 @@ class MPClient:
         if not self.base:
             return None
         try:
-            r = requests.get(f"{self.base}/api/v1/media/search",
-                             params={"title": title, "type": mtype},
-                             headers=self._headers(), timeout=self.timeout)
+            r = requests.get(
+                f"{self.base}/api/v1/media/search",
+                params={"title": title, "type": mtype},
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
@@ -169,8 +187,12 @@ class MPClient:
         if not self.base:
             return None
         try:
-            r = requests.post(f"{self.base}/api/v1/transfer/manual",
-                              headers=self._headers(), json=body, timeout=self.timeout)
+            r = requests.post(
+                f"{self.base}/api/v1/transfer/manual",
+                headers=self._headers(),
+                json=body,
+                timeout=self.timeout,
+            )
             return r.json()
         except Exception as e:
             logger.debug(f"[MSAIR][MP] transfer_manual error: {e}")
@@ -180,25 +202,33 @@ class MPClient:
         if not self.base:
             return None
         try:
-            r = requests.post(f"{self.base}/api/v1/download/",
-                              headers=self._headers(), json=body, timeout=self.timeout)
+            r = requests.post(
+                f"{self.base}/api/v1/download/",
+                headers=self._headers(),
+                json=body,
+                timeout=self.timeout,
+            )
             return r.json()
         except Exception as e:
             logger.debug(f"[MSAIR][MP] download error: {e}")
             return None
+
 
 # ========= 打分器 =========
 class ScoreBreakdown:
     def __init__(self):
         self.items: List[Tuple[str, int]] = []
         self.total: int = 0
+
     def add(self, key: str, val: int):
         self.items.append((key, int(val)))
         self.total += int(val)
 
+
 class Scorer:
     def __init__(self, weights: Dict[str, int]):
         self.w = {**SCORE_WEIGHTS_DEFAULT, **(weights or {})}
+
     def score(self, title: str, ai: Dict[str, Any], ext: Dict[str, Any]) -> ScoreBreakdown:
         bd = ScoreBreakdown()
         name = (ai or {}).get("name") or ""
@@ -211,21 +241,28 @@ class Scorer:
             bd.add("ai_structured", self.w["ai_structured"])
             fields = ["name", "year", "season", "episode", "resolution", "version", "part"]
             filled = sum(1 for f in fields if ai.get(f) not in (None, "", []))
-            bd.add("ai_field_completeness", int(round(self.w["ai_field_completeness_max"] * (filled / len(fields)))))
+            bd.add(
+                "ai_field_completeness",
+                int(round(self.w["ai_field_completeness_max"] * (filled / len(fields)))),
+            )
         else:
             bd.add("unstructured_penalty", self.w["unstructured_penalty"])
 
         # ID 命中
-        if ext.get("tmdbid"): bd.add("tmdb_hit", self.w["tmdb_hit"])
-        if ext.get("doubanid"): bd.add("douban_hit", self.w["douban_hit"])
-        if ext.get("bangumiid"): bd.add("bangumi_hit", self.w["bangumi_hit"])
-        if ext.get("traktid"): bd.add("trakt_hit", self.w["trakt_hit"])
+        if ext.get("tmdbid"):
+            bd.add("tmdb_hit", self.w["tmdb_hit"])
+        if ext.get("doubanid"):
+            bd.add("douban_hit", self.w["douban_hit"])
+        if ext.get("bangumiid"):
+            bd.add("bangumi_hit", self.w["bangumi_hit"])
+        if ext.get("traktid"):
+            bd.add("trakt_hit", self.w["trakt_hit"])
 
         # 标题相似度
         names = ext.get("names") or []
         if name and names:
-            sims = [ _title_similarity(name, n) for n in names ]
-            bd.add("title_sim", int(round(max(sims) * self.w["title_sim_max"])) )
+            sims = [_title_similarity(name, n) for n in names]
+            bd.add("title_sim", int(round(max(sims) * self.w["title_sim_max"])))
 
         # 年份匹配
         y_mp = ext.get("year")
@@ -259,29 +296,34 @@ class Scorer:
 
         return bd
 
-# ========= 插件主体 =========
+
 # ========= 插件主体 =========
 class Multisource_Ai_Recognizer(PluginBase):
     """
     多源AI识别与评分
-    - 这里只重写类名为带下划线的驼峰，便于与目录名/清单键名对齐
+    - 类名使用带下划线驼峰，便于与目录名/清单键名对齐（目录小写：multisource_ai_recognizer）
     """
+
     plugin_name = "多源AI识别与评分"
-    plugin_desc = "LLM + Douban/Trakt/Bangumi/TMDB 多源互证；积分制（可>100）；低分入人工队列并支持自选目录/自动下载"
+    plugin_desc = (
+        "LLM + Douban/Trakt/Bangumi/TMDB 多源互证；积分制（可>100）；低分入人工队列并支持自选目录/自动下载"
+    )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png"
-    plugin_version = "1.3.1"   # ← 同步到 package(.v2).json
+    plugin_version = "1.3.1"  # 与 package(.v2).json 保持一致
 
     def __init__(self):
         super().__init__()
-        # 配置默认值（保持你原来的字段完整即可）
+        # 配置默认值
         self._cfg = {
             "llm_base": "https://api.gptapi.us/v1",
             "llm_model": "deepseek-v3",
             "llm_key": "",
+            # MP 后端直连（可留空）
             "mp_api_base": "",
             "mp_api_token": "",
-            "ask_mode": "smart",           # smart/always/manual
-            "auto_download": False,        # ≥阈值自动下载
+            # 行为
+            "ask_mode": "smart",  # smart/always/manual
+            "auto_download": False,  # ≥阈值自动下载
             "threshold_auto": THRESHOLD_AUTO_DEFAULT,
             "threshold_manual": THRESHOLD_MANUAL_DEFAULT,
             "weights": SCORE_WEIGHTS_DEFAULT,
@@ -296,32 +338,73 @@ class Multisource_Ai_Recognizer(PluginBase):
             "element": "v-container",
             "props": {"fluid": True},
             "children": [
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12, "md": 6}, "children": [
-                        {"element": "v-text-field", "props": {"label": "LLM Base URL", "model": "llm_base", "placeholder": "https://api.gptapi.us/v1"}},
-                        {"element": "v-text-field", "props": {"label": "LLM Model", "model": "llm_model", "placeholder": "deepseek-v3"}},
-                        {"element": "v-text-field", "props": {"label": "LLM API Key", "model": "llm_key", "type": "password"}}
-                    ]},
-                    {"element": "v-col", "props": {"cols": 12, "md": 6}, "children": [
-                        {"element": "v-select", "props": {"label": "AI触发模式", "model": "ask_mode",
-                            "items": [{"title": "智能(smart)", "value": "smart"},
-                                      {"title": "总是(always)", "value": "always"},
-                                      {"title": "手动(manual)", "value": "manual"}]}},
-                        {"element": "v-switch", "props": {"label": "自动下载（≥自动阈值）", "model": "auto_download"}},
-                        {"element": "v-text-field", "props": {"label": "自动通过阈值", "model": "threshold_auto", "type": "number"}},
-                        {"element": "v-text-field", "props": {"label": "人工队列阈值（下限）", "model": "threshold_manual", "type": "number"}}
-                    ]}
-                ]},
-                {"element": "v-alert", "props": {"type": "info", "text": True,
-                    "children": ["打分：ID命中/相似度/年份/季集/一致性/加成 + AI贡献；分数可 >100。推荐阈值：自动≥120；人工80–119；<80强制人工。"]}}
-            ]
+                {
+                    "element": "v-row",
+                    "children": [
+                        {
+                            "element": "v-col",
+                            "props": {"cols": 12, "md": 6},
+                            "children": [
+                                {
+                                    "element": "v-text-field",
+                                    "props": {
+                                        "label": "LLM Base URL",
+                                        "model": "llm_base",
+                                        "placeholder": "https://api.gptapi.us/v1",
+                                    },
+                                },
+                                {
+                                    "element": "v-text-field",
+                                    "props": {"label": "LLM Model", "model": "llm_model", "placeholder": "deepseek-v3"},
+                                },
+                                {
+                                    "element": "v-text-field",
+                                    "props": {"label": "LLM API Key", "model": "llm_key", "type": "password"},
+                                },
+                            ],
+                        },
+                        {
+                            "element": "v-col",
+                            "props": {"cols": 12, "md": 6},
+                            "children": [
+                                {
+                                    "element": "v-select",
+                                    "props": {
+                                        "label": "AI触发模式",
+                                        "model": "ask_mode",
+                                        "items": [
+                                            {"title": "智能(smart)", "value": "smart"},
+                                            {"title": "总是(always)", "value": "always"},
+                                            {"title": "手动(manual)", "value": "manual"},
+                                        ],
+                                    },
+                                },
+                                {"element": "v-switch", "props": {"label": "自动下载（≥自动阈值）", "model": "auto_download"}},
+                                {"element": "v-text-field", "props": {"label": "自动通过阈值", "model": "threshold_auto", "type": "number"}},
+                                {"element": "v-text-field", "props": {"label": "人工队列阈值（下限）", "model": "threshold_manual", "type": "number"}},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "element": "v-alert",
+                    "props": {
+                        "type": "info",
+                        "text": True,
+                        "children": [
+                            "打分：ID命中/相似度/年份/季集/一致性/加成 + AI贡献；分数可 >100。推荐阈值：自动≥120；人工80–119；<80强制人工。"
+                        ],
+                    },
+                },
+            ],
         }
 
     def get_state(self) -> Optional[dict]:
         return self._cfg
 
     def set_state(self, state: dict):
-        if not state: return
+        if not state:
+            return
         self._cfg.update(state or {})
 
     # ===== NameRecognize：只在需要时问 AI =====
@@ -336,7 +419,7 @@ class Multisource_Ai_Recognizer(PluginBase):
         subtitle: str = getattr(data, "subtitle", "") or ""
         # 智能决定是否问AI
         mode = self._cfg.get("ask_mode", "smart")
-        need_ai = (mode == "always")
+        need_ai = mode == "always"
 
         # 判断模糊度（可选后端直连）
         ambiguous = True
@@ -365,7 +448,7 @@ class Multisource_Ai_Recognizer(PluginBase):
             "字段：name, version, part, year, resolution, season, episode。"
             "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
             "无法解析时输出{}。示例："
-            "{\"name\":\"xxx\",\"year\":\"2024\",\"season\":1,\"episode\":2,\"version\":null,\"part\":null,\"resolution\":\"1080p\"}"
+            '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
         )
         ai = llm.parse_title(title, system_prompt)
 
@@ -384,10 +467,11 @@ class Multisource_Ai_Recognizer(PluginBase):
                 ext["se"] = {"season": top.get("season"), "episode": top.get("episode")}
                 names = []
                 for k in ("name", "title", "cn_name", "jp_name", "en_name"):
-                    if top.get(k): names.append(str(top[k]))
+                    if top.get(k):
+                        names.append(str(top[k]))
                 ext["names"] = list(set(names))
-                ext["is_anime"] = (top.get("type") == "anime")
-                ext["is_movie"] = (top.get("type") == "movie")
+                ext["is_anime"] = top.get("type") == "anime"
+                ext["is_movie"] = top.get("type") == "movie"
 
         # 打分
         scorer = Scorer(self._cfg.get("weights") or {})
@@ -418,9 +502,12 @@ class Multisource_Ai_Recognizer(PluginBase):
                 iid = _gen_id()
                 with self._lock:
                     self._queue[iid] = {
-                        "id": iid, "title": title, "ai": ai or {}, "ext": ext or {},
+                        "id": iid,
+                        "title": title,
+                        "ai": ai or {},
+                        "ext": ext or {},
                         "score": {"total": total, "items": bd.items},
-                        "auto_download_payload": body
+                        "auto_download_payload": body,
                     }
             return
 
@@ -429,187 +516,204 @@ class Multisource_Ai_Recognizer(PluginBase):
             iid = _gen_id()
             with self._lock:
                 self._queue[iid] = {
-                    "id": iid, "title": title, "ai": ai or {}, "ext": ext or {},
-                    "score": {"total": total, "items": bd.items}
+                    "id": iid,
+                    "title": title,
+                    "ai": ai or {},
+                    "ext": ext or {},
+                    "score": {"total": total, "items": bd.items},
                 }
         # < th_manual ：不处理（交由其它插件/主程序）
 
     # ===== 页面：人工队列 + 批量AI + 🧪自检 =====
-def get_page(self) -> Optional[dict]:
-    """
-    人工队列页面（保险版）
-    - 顶部：批量AI按钮 / 自检按钮 / 模式切换
-    - 中部：目标存储与路径输入（不依赖弹窗，更稳）
-    - 表格：待确认条目 + 行内“确认并整理”按钮
-    - 自检日志：若有结果则在底部展示
-    """
-    rows = []
-    # 将内存中的队列转成表格数据
-    with self._lock:
-        for k, v in self._queue.items():
-            rows.append({
-                "id": k,
-                "title": v.get("title"),
-                "name": (v.get("ai") or {}).get("name"),
-                "year": (v.get("ai") or {}).get("year"),
-                "score": (v.get("score") or {}).get("total", 0),
-            })
-
-    # 顶部控制区：批量AI、自检、模式切换
-    top_controls = {
-        "element": "v-row",
-        "children": [
-            {
-                "element": "v-col",
-                "props": {"cols": 12, "md": 6},
-                "children": [
+    def get_page(self) -> Optional[dict]:
+        """
+        人工队列页面（保险版）
+        - 顶部：批量AI按钮 / 自检按钮 / 模式切换
+        - 中部：目标存储与路径输入（不依赖弹窗，更稳）
+        - 表格：待确认条目 + 行内“确认并整理”按钮
+        - 自检日志：若有结果则在底部展示
+        """
+        rows = []
+        # 将内存中的队列转成表格数据
+        with self._lock:
+            for k, v in self._queue.items():
+                rows.append(
                     {
-                        "element": "v-btn",
-                        "props": {"color": "primary", "class": "mr-2"},
-                        "events": {"click": {
-                            "api": "plugin/multisource_ai_recognizer/ai_batch",
-                            "method": "post",
-                            "json": {"scope": "all"}
-                        }},
-                        "children": ["🤖 AI识别（全部）"]
-                    },
-                    {
-                        "element": "v-btn",
-                        "props": {"color": "primary", "class": "mr-2"},
-                        "events": {"click": {
-                            "api": "plugin/multisource_ai_recognizer/ai_batch",
-                            "method": "post",
-                            "json": {"scope": "selected", "ids": "{{selectedIds}}"}
-                        }},
-                        "children": ["🤖 AI识别（所选）"]
-                    },
-                    {
-                        "element": "v-btn",
-                        "props": {"color": "secondary"},
-                        "events": {"click": {
-                            "api": "plugin/multisource_ai_recognizer/selftest",
-                            "method": "post"
-                        }},
-                        "children": ["🧪 自检"]
+                        "id": k,
+                        "title": v.get("title"),
+                        "name": (v.get("ai") or {}).get("name"),
+                        "year": (v.get("ai") or {}).get("year"),
+                        "score": (v.get("score") or {}).get("total", 0),
                     }
-                ]
-            },
-            {
-                "element": "v-col",
-                "props": {"cols": 12, "md": 6},
-                "children": [
-                    {
-                        # 触发模式切换：smart / always / manual
-                        "element": "v-select",
-                        "props": {
-                            "label": "AI触发模式",
-                            "model": "ask_mode",
-                            "items": [
-                                {"title": "智能(smart)", "value": "smart"},
-                                {"title": "总是(always)", "value": "always"},
-                                {"title": "手动(manual)", "value": "manual"}
-                            ],
-                            "value": self._cfg.get("ask_mode", "smart")
-                        },
-                        "events": {"change": {
-                            "api": "plugin/multisource_ai_recognizer/config",
-                            "method": "post",
-                            "json": {"ask_mode": "{{ask_mode}}"}
-                        }}
-                    }
-                ]
-            }
-        ]
-    }
+                )
 
-    # 目标目录输入（不依赖弹窗，兼容更好）
-    target_inputs = {
-        "element": "v-row",
-        "children": [
-            {
-                "element": "v-col",
-                "props": {"cols": 12, "md": 4},
-                "children": [
-                    {"element": "v-text-field",
-                     "props": {"label": "目标存储类型", "model": "target_storage", "placeholder": "local/nas/..."}}
-                ]
-            },
-            {
-                "element": "v-col",
-                "props": {"cols": 12, "md": 8},
-                "children": [
-                    {"element": "v-text-field",
-                     "props": {"label": "目标目录路径", "model": "target_path", "placeholder": "/media/Movies"}}
-                ]
-            }
-        ]
-    }
-
-    # 队列数据表：每行“确认并整理”会把当前顶部输入一起提交
-    table = {
-        "element": "v-data-table",
-        "props": {
-            "items": rows,
-            "show-select": True,      # 部分版本是 showSelect，这里两个都给
-            "showSelect": True,
-            "model": "selectedIds",   # 勾选的ID数组，供“所选AI识别”使用
-            "headers": [
-                {"title": "ID", "value": "id"},
-                {"title": "标题", "value": "title"},
-                {"title": "名称", "value": "name"},
-                {"title": "年份", "value": "year"},
-                {"title": "得分", "value": "score"},
-                {"title": "操作", "value": "actions"}
-            ],
-            "item": {
-                "actions": {
-                    "element": "v-btn",
-                    "props": {"text": True, "color": "primary"},
-                    "events": {"click": {
-                        "api": "plugin/multisource_ai_recognizer/confirm",
-                        "method": "post",
-                        "json": {
-                            "id": "{{item.id}}",
-                            "target_storage": "{{target_storage}}",
-                            "target_path": "{{target_path}}"
-                        }
-                    }},
-                    "children": ["确认并整理"]
-                }
-            }
-        }
-    }
-
-    # 页面 children 组装（避免 *logs_block 的星号解包）
-    children = [top_controls, target_inputs, table]
-
-    # 自检日志（若存在则渲染在底部；避免 f-string 内联判断）
-    if self._selftest:
-        ok_flag = bool(self._selftest.get("ok"))
-        logs_list = self._selftest.get("logs") or []
-        txt = "\n".join(logs_list) if logs_list else "（无日志）"
-        result_text = "🧪 自检结果：" + ("通过" if ok_flag else "存在问题")
-
-        children.append({
-            "element": "v-alert",
-            "props": {"type": "success" if ok_flag else "error", "text": True},
-            "children": [result_text]
-        })
-        children.append({
-            "element": "v-card",
+        # 顶部控制区：批量AI、自检、模式切换
+        top_controls = {
+            "element": "v-row",
             "children": [
-                {"element": "v-card-title", "children": ["自检日志"]},
-                {"element": "v-card-text", "children": [txt]}
-            ]
-        })
+                {
+                    "element": "v-col",
+                    "props": {"cols": 12, "md": 6},
+                    "children": [
+                        {
+                            "element": "v-btn",
+                            "props": {"color": "primary", "class": "mr-2"},
+                            "events": {
+                                "click": {
+                                    "api": "plugin/multisource_ai_recognizer/ai_batch",
+                                    "method": "post",
+                                    "json": {"scope": "all"},
+                                }
+                            },
+                            "children": ["🤖 AI识别（全部）"],
+                        },
+                        {
+                            "element": "v-btn",
+                            "props": {"color": "primary", "class": "mr-2"},
+                            "events": {
+                                "click": {
+                                    "api": "plugin/multisource_ai_recognizer/ai_batch",
+                                    "method": "post",
+                                    "json": {"scope": "selected", "ids": "{{selectedIds}}"},
+                                }
+                            },
+                            "children": ["🤖 AI识别（所选）"],
+                        },
+                        {
+                            "element": "v-btn",
+                            "props": {"color": "secondary"},
+                            "events": {"click": {"api": "plugin/multisource_ai_recognizer/selftest", "method": "post"}},
+                            "children": ["🧪 自检"],
+                        },
+                    ],
+                },
+                {
+                    "element": "v-col",
+                    "props": {"cols": 12, "md": 6},
+                    "children": [
+                        {
+                            # 触发模式切换：smart / always / manual
+                            "element": "v-select",
+                            "props": {
+                                "label": "AI触发模式",
+                                "model": "ask_mode",
+                                "items": [
+                                    {"title": "智能(smart)", "value": "smart"},
+                                    {"title": "总是(always)", "value": "always"},
+                                    {"title": "手动(manual)", "value": "manual"},
+                                ],
+                                "value": self._cfg.get("ask_mode", "smart"),
+                            },
+                            "events": {
+                                "change": {
+                                    "api": "plugin/multisource_ai_recognizer/config",
+                                    "method": "post",
+                                    "json": {"ask_mode": "{{ask_mode}}"},
+                                }
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
 
-    # 返回页面 DSL
-    return {
-        "element": "v-container",
-        "props": {"fluid": True},
-        "children": children
-    }
+        # 目标目录输入（不依赖弹窗，兼容更好）
+        target_inputs = {
+            "element": "v-row",
+            "children": [
+                {
+                    "element": "v-col",
+                    "props": {"cols": 12, "md": 4},
+                    "children": [
+                        {
+                            "element": "v-text-field",
+                            "props": {
+                                "label": "目标存储类型",
+                                "model": "target_storage",
+                                "placeholder": "local/nas/...",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "element": "v-col",
+                    "props": {"cols": 12, "md": 8},
+                    "children": [
+                        {
+                            "element": "v-text-field",
+                            "props": {"label": "目标目录路径", "model": "target_path", "placeholder": "/media/Movies"},
+                        }
+                    ],
+                },
+            ],
+        }
 
+        # 队列数据表：每行“确认并整理”会把当前顶部输入一起提交
+        table = {
+            "element": "v-data-table",
+            "props": {
+                "items": rows,
+                "show-select": True,  # 部分版本是 showSelect，这里两个都给
+                "showSelect": True,
+                "model": "selectedIds",  # 勾选的ID数组，供“所选AI识别”使用
+                "headers": [
+                    {"title": "ID", "value": "id"},
+                    {"title": "标题", "value": "title"},
+                    {"title": "名称", "value": "name"},
+                    {"title": "年份", "value": "year"},
+                    {"title": "得分", "value": "score"},
+                    {"title": "操作", "value": "actions"},
+                ],
+                "item": {
+                    "actions": {
+                        "element": "v-btn",
+                        "props": {"text": True, "color": "primary"},
+                        "events": {
+                            "click": {
+                                "api": "plugin/multisource_ai_recognizer/confirm",
+                                "method": "post",
+                                "json": {
+                                    "id": "{{item.id}}",
+                                    "target_storage": "{{target_storage}}",
+                                    "target_path": "{{target_path}}",
+                                },
+                            }
+                        },
+                        "children": ["确认并整理"],
+                    }
+                },
+            },
+        }
+
+        # 页面 children 组装
+        children = [top_controls, target_inputs, table]
+
+        # 自检日志（若存在则渲染在底部）
+        if self._selftest:
+            ok_flag = bool(self._selftest.get("ok"))
+            logs_list = self._selftest.get("logs") or []
+            txt = "\n".join(logs_list) if logs_list else "（无日志）"
+            result_text = "🧪 自检结果：" + ("通过" if ok_flag else "存在问题")
+
+            children.append(
+                {
+                    "element": "v-alert",
+                    "props": {"type": "success" if ok_flag else "error", "text": True},
+                    "children": [result_text],
+                }
+            )
+            children.append(
+                {
+                    "element": "v-card",
+                    "children": [
+                        {"element": "v-card-title", "children": ["自检日志"]},
+                        {"element": "v-card-text", "children": [txt]},
+                    ],
+                }
+            )
+
+        # 返回页面 DSL
+        return {"element": "v-container", "props": {"fluid": True}, "children": children}
 
     # ===== 页面 API =====
     def get_api(self) -> Optional[List[dict]]:
@@ -656,7 +760,7 @@ def get_page(self) -> Optional[dict]:
                 "字段：name, version, part, year, resolution, season, episode。"
                 "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
                 "无法解析时输出{}。示例："
-                "{\"name\":\"xxx\",\"year\":\"2024\",\"season\":1,\"episode\":2,\"version\":null,\"part\":null,\"resolution\":\"1080p\"}"
+                '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
             )
             ai = llm.parse_title(title, system_prompt)
             if ai:
@@ -672,23 +776,25 @@ def get_page(self) -> Optional[dict]:
             return {"code": 404, "msg": "not found"}
 
         body = {
-            "items": [{
-                "path": "",  # 若来源于本地文件识别，可放真实路径
-                "type": "file",
-                "target_storage": target_storage,
-                "target_path": target_path,
-                "mediainfo": {
-                    "name": (item.get("ai") or {}).get("name") or item.get("title"),
-                    "year": (item.get("ai") or {}).get("year") or (item.get("ext") or {}).get("year"),
-                    "season": _safe_int((item.get("ai") or {}).get("season")),
-                    "episode": _safe_int((item.get("ai") or {}).get("episode")),
-                    "tmdbid": (item.get("ext") or {}).get("tmdbid"),
-                    "doubanid": (item.get("ext") or {}).get("doubanid"),
-                    "bangumiid": (item.get("ext") or {}).get("bangumiid"),
-                    "traktid": (item.get("ext") or {}).get("traktid"),
+            "items": [
+                {
+                    "path": "",  # 若来源于本地文件识别，可放真实路径
+                    "type": "file",
+                    "target_storage": target_storage,
+                    "target_path": target_path,
+                    "mediainfo": {
+                        "name": (item.get("ai") or {}).get("name") or item.get("title"),
+                        "year": (item.get("ai") or {}).get("year") or (item.get("ext") or {}).get("year"),
+                        "season": _safe_int((item.get("ai") or {}).get("season")),
+                        "episode": _safe_int((item.get("ai") or {}).get("episode")),
+                        "tmdbid": (item.get("ext") or {}).get("tmdbid"),
+                        "doubanid": (item.get("ext") or {}).get("doubanid"),
+                        "bangumiid": (item.get("ext") or {}).get("bangumiid"),
+                        "traktid": (item.get("ext") or {}).get("traktid"),
+                    },
                 }
-            }],
-            "background": background
+            ],
+            "background": background,
         }
 
         if self._cfg.get("mp_api_base") and self._cfg.get("mp_api_token"):
@@ -755,15 +861,33 @@ def get_page(self) -> Optional[dict]:
         # 3) 打分器健壮性
         try:
             scorer = Scorer(self._cfg.get("weights") or {})
-            ai = {"name": "Demo Title", "year": "2024", "season": 1, "episode": 1, "resolution": "1080p", "version": None, "part": None}
-            ext = {"names": ["Demo Title", "演示标题"], "year": "2024", "se": {"season": 1, "episode": 1}, "tmdbid": 1, "is_movie": True, "imdbid": "tt123", "agree_pairs": 2}
+            ai = {
+                "name": "Demo Title",
+                "year": "2024",
+                "season": 1,
+                "episode": 1,
+                "resolution": "1080p",
+                "version": None,
+                "part": None,
+            }
+            ext = {
+                "names": ["Demo Title", "演示标题"],
+                "year": "2024",
+                "se": {"season": 1, "episode": 1},
+                "tmdbid": 1,
+                "is_movie": True,
+                "imdbid": "tt123",
+                "agree_pairs": 2,
+            }
             bd = scorer.score("Demo Title.2024.S01E01.1080p", ai, ext)
             if isinstance(bd.total, int):
                 log(f"打分器运行正常，总分={bd.total}。", True)
             else:
-                log("打分器返回异常类型。", False); ok = False
+                log("打分器返回异常类型。", False)
+                ok = False
         except Exception as e:
-            log(f"打分器异常：{e}", False); ok = False
+            log(f"打分器异常：{e}", False)
+            ok = False
 
         # 4) 队列与确认流程（不真正提交）
         try:
@@ -774,18 +898,20 @@ def get_page(self) -> Optional[dict]:
                     "title": "SelfTest Item 2024 S01E01 1080p",
                     "ai": {"name": "SelfTest Item", "year": "2024", "season": 1, "episode": 1},
                     "ext": {"tmdbid": 1},
-                    "score": {"total": 130, "items": [("demo", 130)]}
+                    "score": {"total": 130, "items": [("demo", 130)]},
                 }
             r = self.api_confirm(iid, target_storage="local", target_path="/media/SelfTest", background=True)
             # 如果未配置 mp 直连，会返回 next_api 让前端继续；这也算通过
             if isinstance(r, dict) and (r.get("code") == 0 or r.get("next_api")):
                 log("确认流程可用（生成 transfer/manual payload 或已提交）。", True)
             else:
-                log("确认流程返回异常。", False); ok = False
+                log("确认流程返回异常。", False)
+                ok = False
         except Exception as e:
-            log(f"确认流程异常：{e}", False); ok = False
+            log(f"确认流程异常：{e}", False)
+            ok = False
 
-        cost = round((time.time() - t0)*1000)
+        cost = round((time.time() - t0) * 1000)
         log(f"自检完成，用时 {cost} ms。")
         self._selftest = {"ok": ok, "logs": logs, "ts": int(time.time())}
         return {"code": 0 if ok else 1, "msg": "done", "data": self._selftest}
@@ -800,22 +926,40 @@ def get_page(self) -> Optional[dict]:
         cols = {"cols": 12, "md": 6}
         conf = {"refresh": 10, "title": "AI待确认列表"}
         with self._lock:
-            top = [{"id": k, "title": v.get("title"), "score": (v.get("score") or {}).get("total", 0)}
-                   for k, v in list(self._queue.items())[:6]]
-        page = [{
-            "element": "v-list", "children": [
-                {"element": "v-list-item",
-                 "props": {"title": "{{item.title}}", "subtitle": "分数：{{item.score}}"},
-                 "for": {"item": top},
-                 "children": [{
-                     "element": "v-btn", "props": {"text": True, "size": "small"},
-                     "events": {"click": {"api": "plugin/multisource_ai_recognizer/confirm",
-                                          "method": "post",
-                                          "json": {"id": "{{item.id}}", "target_storage": "local", "target_path": "/media/Movies"}}},
-                     "children": ["快速确认"]
-                 }]}
+            top = [
+                {"id": k, "title": v.get("title"), "score": (v.get("score") or {}).get("total", 0)}
+                for k, v in list(self._queue.items())[:6]
             ]
-        }]
+        page = [
+            {
+                "element": "v-list",
+                "children": [
+                    {
+                        "element": "v-list-item",
+                        "props": {"title": "{{item.title}}", "subtitle": "分数：{{item.score}}"},
+                        "for": {"item": top},
+                        "children": [
+                            {
+                                "element": "v-btn",
+                                "props": {"text": True, "size": "small"},
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/multisource_ai_recognizer/confirm",
+                                        "method": "post",
+                                        "json": {
+                                            "id": "{{item.id}}",
+                                            "target_storage": "local",
+                                            "target_path": "/media/Movies",
+                                        },
+                                    }
+                                },
+                                "children": ["快速确认"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
         return cols, conf, page
 
     # ===== 工作流（v2.4.8+） =====
@@ -832,7 +976,7 @@ def get_page(self) -> Optional[dict]:
             "字段：name, version, part, year, resolution, season, episode。"
             "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
             "无法解析时输出{}。示例："
-            "{\"name\":\"xxx\",\"year\":\"2024\",\"season\":1,\"episode\":2,\"version\":null,\"part\":null,\"resolution\":\"1080p\"}"
+            '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
         )
         ai = llm.parse_title(title, system_prompt)
         bd = Scorer(self._cfg.get("weights") or {}).score(title, ai or {}, {})
@@ -841,24 +985,29 @@ def get_page(self) -> Optional[dict]:
 
     # ===== 消息交互（v2.5.7+） =====
     def get_command(self) -> List[Dict[str, Any]]:
-        return [{
-            "cmd": "/msair",
-            "event": EventType.PluginAction,
-            "desc": "多源AI识别面板",
-            "category": "插件交互",
-            "data": {"action": "msair_menu"}
-        }]
+        return [
+            {
+                "cmd": "/msair",
+                "event": EventType.PluginAction,
+                "desc": "多源AI识别面板",
+                "category": "插件交互",
+                "data": {"action": "msair_menu"},
+            }
+        ]
 
     @eventmanager.register(EventType.PluginAction)
     def command_action(self, event: Event):
         data = getattr(event, "event_data", {}) or {}
         if data.get("action") != "msair_menu":
             return
-        channel = data.get("channel"); user = data.get("user")
-        buttons = [[
-            {"text": "🔍 查看待确认", "callback_data": f"[PLUGIN]{self.__class__.__name__}|queue"},
-            {"text": "⚙️ 设置", "callback_data": f"[PLUGIN]{self.__class__.__name__}|settings"}
-        ]]
+        channel = data.get("channel")
+        user = data.get("user")
+        buttons = [
+            [
+                {"text": "🔍 查看待确认", "callback_data": f"[PLUGIN]{self.__class__.__name__}|queue"},
+                {"text": "⚙️ 设置", "callback_data": f"[PLUGIN]{self.__class__.__name__}|settings"},
+            ]
+        ]
         self.post_message(channel=channel, title="多源AI识别", text="请选择：", userid=user, buttons=buttons)
 
     @eventmanager.register(EventType.MessageAction)
@@ -867,7 +1016,8 @@ def get_page(self) -> Optional[dict]:
         if data.get("plugin_id") != self.__class__.__name__:
             return
         text = data.get("text", "")
-        channel = data.get("channel"); user = data.get("userid")
+        channel = data.get("channel")
+        user = data.get("userid")
         if text == "queue":
             with self._lock:
                 cnt = len(self._queue)
@@ -888,20 +1038,40 @@ def get_page(self) -> Optional[dict]:
             "get_parent_item": self.get_parent_item,
             "snapshot_storage": self.snapshot_storage,
             "storage_usage": self.storage_usage,
-            "support_transtype": self.support_transtype
+            "support_transtype": self.support_transtype,
         }
 
     # 占位：仅当 storage=="msair" 时你再改成真实逻辑；否则返回 None
-    def list_files(self, fileitem, recursion: bool = False): return None
-    def any_files(self, fileitem, extensions: list = None): return None
-    def download_file(self, fileitem, path=None): return None
-    def upload_file(self, fileitem, path, new_name: Optional[str] = None): return None
-    def delete_file(self, fileitem): return None
-    def rename_file(self, fileitem, name: str): return None
-    def get_file_item(self, storage: str, path): return None
-    def get_parent_item(self, fileitem): return None
-    def snapshot_storage(self, storage: str, path): return None
-    def storage_usage(self, storage: str): return None
+    def list_files(self, fileitem, recursion: bool = False):
+        return None
+
+    def any_files(self, fileitem, extensions: list = None):
+        return None
+
+    def download_file(self, fileitem, path=None):
+        return None
+
+    def upload_file(self, fileitem, path, new_name: Optional[str] = None):
+        return None
+
+    def delete_file(self, fileitem):
+        return None
+
+    def rename_file(self, fileitem, name: str):
+        return None
+
+    def get_file_item(self, storage: str, path):
+        return None
+
+    def get_parent_item(self, fileitem):
+        return None
+
+    def snapshot_storage(self, storage: str, path):
+        return None
+
+    def storage_usage(self, storage: str):
+        return None
+
     @staticmethod
     def support_transtype(storage: str) -> Optional[dict]:
         return {"move": "移动", "copy": "复制"}
