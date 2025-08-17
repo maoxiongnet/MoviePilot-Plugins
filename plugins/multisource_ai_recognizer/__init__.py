@@ -23,7 +23,23 @@ import requests
 
 # ===== MoviePilot 基础导入 =====
 from app.core.event import eventmanager, Event, EventType, ChainEventType
-from app.core.plugin import PluginBase
+# === MoviePilot 插件基类兼容层 ===
+try:
+    # 新一些的分支：有 PluginBase
+    from app.core.plugin import PluginBase as MPPluginBase
+except Exception:
+    try:
+        # 另一些分支：只有 Plugin
+        from app.core.plugin import Plugin as MPPluginBase
+    except Exception:
+        try:
+            # 极老的结构（少见）：app.plugins.Plugin
+            from app.plugins import Plugin as MPPluginBase
+        except Exception as e:
+            raise ImportError(
+                "无法从 app.core.plugin 导入 PluginBase/Plugin —— 当前 MoviePilot 版本或分支的插件基类命名不一致。"
+                "请升级 MoviePilot，或保留此兼容层。"
+            ) from e
 from app.log import logger
 
 
@@ -298,7 +314,7 @@ class Scorer:
 
 
 # ========= 插件主体 =========
-class Multisource_Ai_Recognizer(PluginBase):
+class Multisource_Ai_Recognizer(MPPluginBase):
     """
     多源AI识别与评分
     - 类名使用带下划线驼峰，便于与目录名/清单键名对齐（目录小写：multisource_ai_recognizer）
