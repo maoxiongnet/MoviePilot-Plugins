@@ -3,12 +3,13 @@
     "name": "AI辅助识别与评分",
     "description": "LLM(JSON-only)辅助媒体标题解析；积分制（可>100）；仅不确定时触发AI；支持批量AI/人工队列/自动下载/自检。",
     "labels": "识别,AI",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "icon": "chatgpt.png",
     "author": "maoxiongnet",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.5.0": "修复评分系统（从event_data提取外部信息）；API端点鉴权；_save_queue线程安全；api_config持久化+类型校验；自测试dry-run不发送真实请求；Season/Episode 0正确处理；设置页添加MP API配置；清理未使用代码。",
       "v1.4.0": "修复：识别结果回写event_data；修复smart模式循环调用；队列持久化；竞态条件修复；批量AI后重新计分；改进标题相似度算法；添加init_plugin标准生命周期；移除未实现的存储模块骨架；诚实化插件描述。",
       "v1.3.1": "修复bug。",
       "v1.3.0": "新增自检、批量AI（全部/所选）、智能触发；稳健的页面交互与日志。"
