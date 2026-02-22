@@ -81,6 +81,61 @@ THRESHOLD_AUTO_DEFAULT = 120
 THRESHOLD_MANUAL_DEFAULT = 80
 
 
+# ========= LLM 服务商预设 =========
+LLM_PROVIDERS = {
+    "deepseek": {
+        "name": "DeepSeek",
+        "base": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+    },
+    "openai": {
+        "name": "OpenAI (ChatGPT)",
+        "base": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+    },
+    "gemini": {
+        "name": "Google Gemini",
+        "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-2.0-flash",
+    },
+    "qwen": {
+        "name": "通义千问 (Qwen)",
+        "base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+    },
+    "zhipu": {
+        "name": "智谱 (GLM)",
+        "base": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+    },
+    "moonshot": {
+        "name": "月之暗面 (Kimi)",
+        "base": "https://api.moonshot.cn/v1",
+        "model": "moonshot-v1-8k",
+    },
+    "yi": {
+        "name": "零一万物 (Yi)",
+        "base": "https://api.lingyiwanwu.com/v1",
+        "model": "yi-lightning",
+    },
+    "groq": {
+        "name": "Groq",
+        "base": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+    },
+    "custom": {
+        "name": "自定义",
+        "base": "",
+        "model": "",
+    },
+}
+
+# 给设置页用的下拉选项
+LLM_PROVIDER_OPTIONS = [
+    {"title": v["name"], "value": k} for k, v in LLM_PROVIDERS.items()
+]
+
+
 # ========= 小工具 =========
 def _safe_int(x, default=None):
     try:
@@ -320,7 +375,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         "LLM 辅助媒体标题解析；积分制评分（可>100）；低分入人工队列并支持自选目录/自动下载"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "maoxiongnet"
     plugin_order = 50
 
@@ -336,8 +391,9 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         插件初始化（MoviePilot 标准生命周期方法）
         """
         default_cfg = {
-            "llm_base": "https://api.gptapi.us/v1",
-            "llm_model": "deepseek-v3",
+            "llm_provider": "deepseek",
+            "llm_base": "",
+            "llm_model": "",
             "llm_key": "",
             "mp_api_base": "",
             "mp_api_token": "",
@@ -357,11 +413,13 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         self._cfg = default_cfg
 
     def _make_llm_client(self) -> LLMClient:
-        return LLMClient(
-            self._cfg.get("llm_base", ""),
-            self._cfg.get("llm_key", ""),
-            self._cfg.get("llm_model", ""),
-        )
+        provider = self._cfg.get("llm_provider", "custom")
+        preset = LLM_PROVIDERS.get(provider, LLM_PROVIDERS["custom"])
+        # 用户手动填写的值优先，否则用预设
+        base = self._cfg.get("llm_base") or preset.get("base", "")
+        model = self._cfg.get("llm_model") or preset.get("model", "")
+        key = self._cfg.get("llm_key", "")
+        return LLMClient(base, key, model)
 
     def _save_queue(self):
         """将队列持久化到插件配置中"""
@@ -386,20 +444,34 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                             "props": {"cols": 12, "md": 6},
                             "children": [
                                 {
-                                    "element": "v-text-field",
+                                    "element": "v-select",
                                     "props": {
-                                        "label": "LLM Base URL",
-                                        "model": "llm_base",
-                                        "placeholder": "https://api.gptapi.us/v1",
+                                        "label": "LLM 服务商",
+                                        "model": "llm_provider",
+                                        "items": LLM_PROVIDER_OPTIONS,
+                                        "hint": "选择后自动填充 Base URL 和 Model，也可手动覆盖",
+                                        "persistent-hint": True,
                                     },
                                 },
                                 {
                                     "element": "v-text-field",
-                                    "props": {"label": "LLM Model", "model": "llm_model", "placeholder": "deepseek-v3"},
+                                    "props": {"label": "LLM API Key", "model": "llm_key", "type": "password"},
                                 },
                                 {
                                     "element": "v-text-field",
-                                    "props": {"label": "LLM API Key", "model": "llm_key", "type": "password"},
+                                    "props": {
+                                        "label": "Base URL（留空使用服务商预设）",
+                                        "model": "llm_base",
+                                        "placeholder": "留空 = 使用所选服务商默认地址",
+                                    },
+                                },
+                                {
+                                    "element": "v-text-field",
+                                    "props": {
+                                        "label": "Model（留空使用服务商预设）",
+                                        "model": "llm_model",
+                                        "placeholder": "留空 = 使用所选服务商默认模型",
+                                    },
                                 },
                                 {
                                     "element": "v-text-field",
@@ -922,7 +994,11 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             logger.info(f"[MSAIR][SELFTEST] {msg}")
 
         # 1) LLM 测试
-        base, key, model = self._cfg.get("llm_base"), self._cfg.get("llm_key"), self._cfg.get("llm_model")
+        provider = self._cfg.get("llm_provider", "custom")
+        preset = LLM_PROVIDERS.get(provider, LLM_PROVIDERS["custom"])
+        base = self._cfg.get("llm_base") or preset.get("base", "")
+        model = self._cfg.get("llm_model") or preset.get("model", "")
+        key = self._cfg.get("llm_key", "")
         if not base or not key:
             log("LLM 配置缺失（llm_base/llm_key），跳过 LLM 自测。", False)
             ok = False
