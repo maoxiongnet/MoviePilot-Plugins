@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Multisource AI Recognizer for MoviePilot
-- LLM(JSON-only) + Douban/Trakt/Bangumi/TMDB 多源互证
+AI 辅助识别插件 for MoviePilot
+- 使用 LLM (JSON-only) 辅助解析媒体标题
 - 积分制评分（可>100），阈值可配
-- 智能触发AI：仅当不确定/模糊时才问AI；也支持“全部问/只问所选”
-- 自动下载（≥阈值可选），人工队列手动确认并可选择目录（transfer/manual）
+- 智能触发AI：仅当主程序识别结果不完整时才问AI；也支持"总是/手动"
+- 自动下载（>=阈值可选），人工队列手动确认并可选择目录（transfer/manual）
 - 仪表板、按钮交互、工作流、消息回调、配置页
-- 🧪 自检按钮：LLM/主程序API/打分器/队列流程健康检查 + 详细日志
+- 自检按钮：LLM/主程序API/打分器/队列流程健康检查 + 详细日志
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
 import threading
 import random
 import string
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -25,15 +27,12 @@ import requests
 from app.core.event import eventmanager, Event, EventType, ChainEventType
 # === MoviePilot 插件基类兼容层 ===
 try:
-    # 新一些的分支：有 PluginBase
     from app.core.plugin import PluginBase as MPPluginBase
 except Exception:
     try:
-        # 另一些分支：只有 Plugin
         from app.core.plugin import Plugin as MPPluginBase
     except Exception:
         try:
-            # 极老的结构（少见）：app.plugins.Plugin
             from app.plugins import Plugin as MPPluginBase
         except Exception as e:
             raise ImportError(
@@ -41,6 +40,16 @@ except Exception:
                 "请升级 MoviePilot，或保留此兼容层。"
             ) from e
 from app.log import logger
+
+
+# ========= LLM System Prompt（全局常量，避免重复）=========
+LLM_SYSTEM_PROMPT = (
+    "你是严格模式的命名解析器。只输出一个JSON对象，不得包含解释、Markdown或代码块。"
+    "字段：name, version, part, year, resolution, season, episode。"
+    "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
+    '无法解析时输出{}。示例：'
+    '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
+)
 
 
 # ========= 默认权重与阈值 =========
@@ -87,14 +96,11 @@ def _gen_id(n=8):
 
 def _title_similarity(a: str, b: str) -> float:
     """
-    非严格相似度（0~1），简化实现：字符集 Jaccard
+    标题相似度（0~1），使用 SequenceMatcher 进行序列级比较。
     """
     if not a or not b:
         return 0.0
-    sa, sb = set(a.lower()), set(b.lower())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / max(1, len(sa | sb))
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
 # ========= LLM 调用（仅 JSON 模式）=========
@@ -167,22 +173,6 @@ class MPClient:
             else {"Content-Type": "application/json"}
         )
 
-    def recognize(self, title: str, subtitle: str = "") -> Optional[Dict[str, Any]]:
-        if not self.base:
-            return None
-        try:
-            r = requests.get(
-                f"{self.base}/api/v1/media/recognize",
-                params={"title": title, "subtitle": subtitle},
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            logger.debug(f"[MSAIR][MP] recognize error: {e}")
-        return None
-
     def search(self, title: str, mtype: str = "media") -> Optional[Dict[str, Any]]:
         if not self.base:
             return None
@@ -253,7 +243,7 @@ class Scorer:
         episode = _safe_int((ai or {}).get("episode"))
 
         # AI 贡献
-        if ai and isinstance(ai, dict):
+        if ai and isinstance(ai, dict) and ai.get("name"):
             bd.add("ai_structured", self.w["ai_structured"])
             fields = ["name", "year", "season", "episode", "resolution", "version", "part"]
             filled = sum(1 for f in fields if ai.get(f) not in (None, "", []))
@@ -261,18 +251,27 @@ class Scorer:
                 "ai_field_completeness",
                 int(round(self.w["ai_field_completeness_max"] * (filled / len(fields)))),
             )
-        else:
+        elif ai is not None:
             bd.add("unstructured_penalty", self.w["unstructured_penalty"])
 
         # ID 命中
+        ids_found = set()
         if ext.get("tmdbid"):
             bd.add("tmdb_hit", self.w["tmdb_hit"])
+            ids_found.add("tmdb")
         if ext.get("doubanid"):
             bd.add("douban_hit", self.w["douban_hit"])
+            ids_found.add("douban")
         if ext.get("bangumiid"):
             bd.add("bangumi_hit", self.w["bangumi_hit"])
+            ids_found.add("bangumi")
         if ext.get("traktid"):
             bd.add("trakt_hit", self.w["trakt_hit"])
+            ids_found.add("trakt")
+
+        # ID 冲突检测：如果 ext 中标记了来自不同源的 ID 指向不同媒体
+        if ext.get("id_conflict"):
+            bd.add("id_conflict", self.w["id_conflict"])
 
         # 标题相似度
         names = ext.get("names") or []
@@ -316,37 +315,62 @@ class Scorer:
 # ========= 插件主体 =========
 class Multisource_Ai_Recognizer(MPPluginBase):
     """
-    多源AI识别与评分
+    AI 辅助识别与评分
     - 类名使用带下划线驼峰，便于与目录名/清单键名对齐（目录小写：multisource_ai_recognizer）
     """
 
-    plugin_name = "多源AI识别与评分"
+    plugin_name = "AI辅助识别与评分"
     plugin_desc = (
-        "LLM + Douban/Trakt/Bangumi/TMDB 多源互证；积分制（可>100）；低分入人工队列并支持自选目录/自动下载"
+        "LLM 辅助媒体标题解析；积分制评分（可>100）；低分入人工队列并支持自选目录/自动下载"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/chatgpt.png"
-    plugin_version = "1.3.1"  # 与 package(.v2).json 保持一致
+    plugin_version = "1.4.0"
 
     def __init__(self):
         super().__init__()
-        # 配置默认值
-        self._cfg = {
+        self._cfg: Dict[str, Any] = {}
+        self._queue: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._selftest: Dict[str, Any] = {}
+
+    def init_plugin(self, config: dict = None):
+        """
+        插件初始化（MoviePilot 标准生命周期方法）
+        """
+        default_cfg = {
             "llm_base": "https://api.gptapi.us/v1",
             "llm_model": "deepseek-v3",
             "llm_key": "",
-            # MP 后端直连（可留空）
             "mp_api_base": "",
             "mp_api_token": "",
-            # 行为
-            "ask_mode": "smart",  # smart/always/manual
-            "auto_download": False,  # ≥阈值自动下载
+            "ask_mode": "smart",
+            "auto_download": False,
             "threshold_auto": THRESHOLD_AUTO_DEFAULT,
             "threshold_manual": THRESHOLD_MANUAL_DEFAULT,
             "weights": SCORE_WEIGHTS_DEFAULT,
         }
-        self._queue: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-        self._selftest: Dict[str, Any] = {}
+        if config:
+            default_cfg.update(config)
+            # 恢复持久化的队列
+            saved_queue = config.get("_queue")
+            if isinstance(saved_queue, dict):
+                with self._lock:
+                    self._queue = saved_queue
+        self._cfg = default_cfg
+
+    def _make_llm_client(self) -> LLMClient:
+        return LLMClient(
+            self._cfg.get("llm_base", ""),
+            self._cfg.get("llm_key", ""),
+            self._cfg.get("llm_model", ""),
+        )
+
+    def _save_queue(self):
+        """将队列持久化到插件配置中"""
+        try:
+            self.update_config({**self._cfg, "_queue": self._queue})
+        except Exception as e:
+            logger.debug(f"[MSAIR] save queue failed: {e}")
 
     # ===== 配置页（可视化） =====
     def get_setting(self) -> Optional[dict]:
@@ -395,7 +419,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                                         ],
                                     },
                                 },
-                                {"element": "v-switch", "props": {"label": "自动下载（≥自动阈值）", "model": "auto_download"}},
+                                {"element": "v-switch", "props": {"label": "自动下载（>=自动阈值）", "model": "auto_download"}},
                                 {"element": "v-text-field", "props": {"label": "自动通过阈值", "model": "threshold_auto", "type": "number"}},
                                 {"element": "v-text-field", "props": {"label": "人工队列阈值（下限）", "model": "threshold_manual", "type": "number"}},
                             ],
@@ -404,26 +428,27 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                 },
                 {
                     "element": "v-alert",
-                    "props": {
-                        "type": "info",
-                        "text": True,
-                        "children": [
-                            "打分：ID命中/相似度/年份/季集/一致性/加成 + AI贡献；分数可 >100。推荐阈值：自动≥120；人工80–119；<80强制人工。"
-                        ],
-                    },
+                    "props": {"type": "info", "text": True},
+                    "children": [
+                        "打分：AI贡献/标题相似度/年份/季集匹配；分数可 >100。推荐阈值：自动>=120；人工80-119；<80交由主程序处理。"
+                    ],
                 },
             ],
         }
 
     def get_state(self) -> Optional[dict]:
-        return self._cfg
+        return {**self._cfg, "_queue": self._queue}
 
     def set_state(self, state: dict):
         if not state:
             return
-        self._cfg.update(state or {})
+        saved_queue = state.pop("_queue", None)
+        self._cfg.update(state)
+        if isinstance(saved_queue, dict):
+            with self._lock:
+                self._queue = saved_queue
 
-    # ===== NameRecognize：只在需要时问 AI =====
+    # ===== NameRecognize 链式事件处理 =====
     @eventmanager.register(ChainEventType.NameRecognize)
     def on_name_recognize(self, event: Event):
         if not self.is_enabled:
@@ -432,66 +457,52 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         if not data:
             return
         title: str = getattr(data, "title", "") or ""
-        subtitle: str = getattr(data, "subtitle", "") or ""
-        # 智能决定是否问AI
-        mode = self._cfg.get("ask_mode", "smart")
-        need_ai = mode == "always"
-
-        # 判断模糊度（可选后端直连）
-        ambiguous = True
-        mp_ctx = None
-        if self._cfg.get("mp_api_base"):
-            mp = MPClient(self._cfg["mp_api_base"], self._cfg["mp_api_token"])
-            mp_ctx = mp.recognize(title, subtitle)
-            try:
-                cands = (mp_ctx or {}).get("candidates") or (mp_ctx or {}).get("data") or []
-                ambiguous = len(cands) != 1
-            except Exception:
-                ambiguous = True
-
-        if mode == "smart" and ambiguous:
-            need_ai = True
-        if mode == "manual":
-            need_ai = False
-
-        if not need_ai:
+        if not title.strip():
             return
 
-        # 调 AI
-        llm = LLMClient(self._cfg["llm_base"], self._cfg["llm_key"], self._cfg["llm_model"])
-        system_prompt = (
-            "你是严格模式的命名解析器。只输出一个JSON对象，不得包含解释、Markdown或代码块。"
-            "字段：name, version, part, year, resolution, season, episode。"
-            "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
-            "无法解析时输出{}。示例："
-            '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
-        )
-        ai = llm.parse_title(title, system_prompt)
+        mode = self._cfg.get("ask_mode", "smart")
 
-        # 组装 ext（可扩展Trakt/TMDB/Bangumi，这里用mp_ctx）
+        # manual 模式下不自动触发
+        if mode == "manual":
+            return
+
+        # smart 模式：检查 event_data 中是否已有可靠的识别结果
+        # 如果主程序或其它插件已经填充了 name 字段，说明识别成功，无需 AI 介入
+        if mode == "smart":
+            existing_name = getattr(data, "name", None)
+            if existing_name:
+                logger.debug(f"[MSAIR] smart mode: already recognized as '{existing_name}', skipping AI")
+                return
+
+        # 调 AI 解析标题
+        llm = self._make_llm_client()
+        ai = llm.parse_title(title, LLM_SYSTEM_PROMPT)
+        if not ai or not ai.get("name"):
+            logger.debug(f"[MSAIR] LLM returned empty result for: {title}")
+            return
+
+        # 将 AI 识别结果写回 event_data，使主程序能接收到
+        ai_name = ai.get("name")
+        ai_year = ai.get("year")
+        ai_season = _safe_int(ai.get("season"))
+        ai_episode = _safe_int(ai.get("episode"))
+
+        if ai_name:
+            data.name = str(ai_name)
+        if ai_year:
+            data.year = str(ai_year)
+        if ai_season is not None:
+            data.season = ai_season
+        if ai_episode is not None:
+            data.episode = ai_episode
+
+        logger.info(f"[MSAIR] AI recognized: name={ai_name}, year={ai_year}, "
+                     f"S{ai_season}E{ai_episode} for title: {title}")
+
+        # 评分（用于队列管理，不影响主程序识别流程）
         ext: Dict[str, Any] = {}
-        if mp_ctx:
-            cands = mp_ctx.get("candidates") or mp_ctx.get("data") or []
-            if cands:
-                top = cands[0]
-                ext["tmdbid"] = top.get("tmdbid")
-                ext["doubanid"] = top.get("doubanid")
-                ext["bangumiid"] = top.get("bangumiid")
-                ext["traktid"] = top.get("traktid")
-                ext["imdbid"] = top.get("imdbid")
-                ext["year"] = top.get("year")
-                ext["se"] = {"season": top.get("season"), "episode": top.get("episode")}
-                names = []
-                for k in ("name", "title", "cn_name", "jp_name", "en_name"):
-                    if top.get(k):
-                        names.append(str(top[k]))
-                ext["names"] = list(set(names))
-                ext["is_anime"] = top.get("type") == "anime"
-                ext["is_movie"] = top.get("type") == "movie"
-
-        # 打分
         scorer = Scorer(self._cfg.get("weights") or {})
-        bd = scorer.score(title, ai or {}, ext or {})
+        bd = scorer.score(title, ai, ext)
         total = bd.total
         th_auto = int(self._cfg.get("threshold_auto", THRESHOLD_AUTO_DEFAULT))
         th_manual = int(self._cfg.get("threshold_manual", THRESHOLD_MANUAL_DEFAULT))
@@ -500,57 +511,45 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         if total >= th_auto and self._cfg.get("auto_download"):
             body = {
                 "mediainfo": {
-                    "title": (ai or {}).get("name") or title,
-                    "year": (ai or {}).get("year") or ext.get("year"),
-                    "season": _safe_int((ai or {}).get("season")),
-                    "episode": _safe_int((ai or {}).get("episode")),
-                    "tmdbid": ext.get("tmdbid"),
-                    "doubanid": ext.get("doubanid"),
-                    "bangumiid": ext.get("bangumiid"),
-                    "traktid": ext.get("traktid"),
+                    "title": ai_name or title,
+                    "year": ai_year,
+                    "season": ai_season,
+                    "episode": ai_episode,
                 }
             }
             if self._cfg.get("mp_api_base") and self._cfg.get("mp_api_token"):
                 resp = MPClient(self._cfg["mp_api_base"], self._cfg["mp_api_token"]).download_with_media(body)
                 logger.info(f"[MSAIR] auto download resp: {resp}")
             else:
-                # 无直连：放队列，前端可一键提交到 api/v1/download/
                 iid = _gen_id()
                 with self._lock:
                     self._queue[iid] = {
                         "id": iid,
                         "title": title,
-                        "ai": ai or {},
-                        "ext": ext or {},
+                        "ai": ai,
+                        "ext": ext,
                         "score": {"total": total, "items": bd.items},
                         "auto_download_payload": body,
                     }
+                self._save_queue()
             return
 
-        # 入人工队列 / 或低分直接放过
+        # 入人工队列
         if total >= th_manual:
             iid = _gen_id()
             with self._lock:
                 self._queue[iid] = {
                     "id": iid,
                     "title": title,
-                    "ai": ai or {},
-                    "ext": ext or {},
+                    "ai": ai,
+                    "ext": ext,
                     "score": {"total": total, "items": bd.items},
                 }
-        # < th_manual ：不处理（交由其它插件/主程序）
+            self._save_queue()
 
-    # ===== 页面：人工队列 + 批量AI + 🧪自检 =====
+    # ===== 页面：人工队列 + 批量AI + 自检 =====
     def get_page(self) -> Optional[dict]:
-        """
-        人工队列页面（保险版）
-        - 顶部：批量AI按钮 / 自检按钮 / 模式切换
-        - 中部：目标存储与路径输入（不依赖弹窗，更稳）
-        - 表格：待确认条目 + 行内“确认并整理”按钮
-        - 自检日志：若有结果则在底部展示
-        """
         rows = []
-        # 将内存中的队列转成表格数据
         with self._lock:
             for k, v in self._queue.items():
                 rows.append(
@@ -563,7 +562,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                     }
                 )
 
-        # 顶部控制区：批量AI、自检、模式切换
         top_controls = {
             "element": "v-row",
             "children": [
@@ -581,7 +579,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                                     "json": {"scope": "all"},
                                 }
                             },
-                            "children": ["🤖 AI识别（全部）"],
+                            "children": ["AI识别（全部）"],
                         },
                         {
                             "element": "v-btn",
@@ -593,13 +591,13 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                                     "json": {"scope": "selected", "ids": "{{selectedIds}}"},
                                 }
                             },
-                            "children": ["🤖 AI识别（所选）"],
+                            "children": ["AI识别（所选）"],
                         },
                         {
                             "element": "v-btn",
                             "props": {"color": "secondary"},
                             "events": {"click": {"api": "plugin/multisource_ai_recognizer/selftest", "method": "post"}},
-                            "children": ["🧪 自检"],
+                            "children": ["自检"],
                         },
                     ],
                 },
@@ -608,7 +606,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                     "props": {"cols": 12, "md": 6},
                     "children": [
                         {
-                            # 触发模式切换：smart / always / manual
                             "element": "v-select",
                             "props": {
                                 "label": "AI触发模式",
@@ -633,7 +630,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             ],
         }
 
-        # 目标目录输入（不依赖弹窗，兼容更好）
         target_inputs = {
             "element": "v-row",
             "children": [
@@ -664,14 +660,13 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             ],
         }
 
-        # 队列数据表：每行“确认并整理”会把当前顶部输入一起提交
         table = {
             "element": "v-data-table",
             "props": {
                 "items": rows,
-                "show-select": True,  # 部分版本是 showSelect，这里两个都给
+                "show-select": True,
                 "showSelect": True,
-                "model": "selectedIds",  # 勾选的ID数组，供“所选AI识别”使用
+                "model": "selectedIds",
                 "headers": [
                     {"title": "ID", "value": "id"},
                     {"title": "标题", "value": "title"},
@@ -701,15 +696,13 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             },
         }
 
-        # 页面 children 组装
         children = [top_controls, target_inputs, table]
 
-        # 自检日志（若存在则渲染在底部）
         if self._selftest:
             ok_flag = bool(self._selftest.get("ok"))
             logs_list = self._selftest.get("logs") or []
             txt = "\n".join(logs_list) if logs_list else "（无日志）"
-            result_text = "🧪 自检结果：" + ("通过" if ok_flag else "存在问题")
+            result_text = "自检结果：" + ("通过" if ok_flag else "存在问题")
 
             children.append(
                 {
@@ -728,7 +721,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                 }
             )
 
-        # 返回页面 DSL
         return {"element": "v-container", "props": {"fluid": True}, "children": children}
 
     # ===== 页面 API =====
@@ -738,7 +730,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             {"path": "/confirm", "endpoint": self.api_confirm, "methods": ["POST"], "summary": "确认并整理"},
             {"path": "/config", "endpoint": self.api_config, "methods": ["POST"], "summary": "更新配置（ask_mode/阈值）"},
             {"path": "/ai_batch", "endpoint": self.api_ai_batch, "methods": ["POST"], "summary": "批量AI识别（全部/所选）"},
-            {"path": "/selftest", "endpoint": self.api_selftest, "methods": ["POST"], "summary": "插件自检（LLM/MP/评分/流程）"},
+            {"path": "/selftest", "endpoint": self.api_selftest, "methods": ["POST"], "summary": "插件自检（LLM/评分/流程）"},
         ]
 
     def api_queue(self):
@@ -754,7 +746,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         return {"code": 0, "msg": "ok", "changed": changed}
 
     def api_ai_batch(self, scope: str = "all", ids: Optional[List[str]] = None):
-        # 遍历目标项，对“还没有 AI 结果”的再问一次 AI（节省费用）
         cnt = 0
         targets: List[str] = []
         with self._lock:
@@ -762,39 +753,49 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                 targets = [i for i in ids if i in self._queue]
             else:
                 targets = list(self._queue.keys())
+
+        llm = self._make_llm_client()
+        scorer = Scorer(self._cfg.get("weights") or {})
+
         for iid in targets:
             with self._lock:
                 item = self._queue.get(iid)
-            if not item:
+                if not item:
+                    continue
+                # Deep copy to avoid race conditions
+                item_copy = copy.deepcopy(item)
+
+            title = item_copy.get("title") or ""
+            if (item_copy.get("ai") or {}).get("name"):
                 continue
-            title = item.get("title") or ""
-            if (item.get("ai") or {}).get("name"):
-                continue
-            llm = LLMClient(self._cfg["llm_base"], self._cfg["llm_key"], self._cfg["llm_model"])
-            system_prompt = (
-                "你是严格模式的命名解析器。只输出一个JSON对象，不得包含解释、Markdown或代码块。"
-                "字段：name, version, part, year, resolution, season, episode。"
-                "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
-                "无法解析时输出{}。示例："
-                '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
-            )
-            ai = llm.parse_title(title, system_prompt)
+
+            ai = llm.parse_title(title, LLM_SYSTEM_PROMPT)
             if ai:
+                # Re-score with new AI result
+                ext = item_copy.get("ext") or {}
+                bd = scorer.score(title, ai, ext)
                 with self._lock:
-                    item["ai"] = ai
-                    cnt += 1
+                    if iid in self._queue:
+                        self._queue[iid]["ai"] = ai
+                        self._queue[iid]["score"] = {"total": bd.total, "items": bd.items}
+                        cnt += 1
+
+        if cnt > 0:
+            self._save_queue()
         return {"code": 0, "msg": f"AI识别完成：{cnt} 条"}
 
     def api_confirm(self, id: str, target_storage: str = "", target_path: str = "", background: bool = True):
         with self._lock:
             item = self._queue.get(id)
-        if not item:
-            return {"code": 404, "msg": "not found"}
+            if not item:
+                return {"code": 404, "msg": "not found"}
+            # Deep copy under lock to avoid race conditions
+            item = copy.deepcopy(item)
 
         body = {
             "items": [
                 {
-                    "path": "",  # 若来源于本地文件识别，可放真实路径
+                    "path": "",
                     "type": "file",
                     "target_storage": target_storage,
                     "target_path": target_path,
@@ -817,23 +818,22 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             resp = MPClient(self._cfg["mp_api_base"], self._cfg["mp_api_token"]).transfer_manual(body)
             with self._lock:
                 self._queue.pop(id, None)
+            self._save_queue()
             return {"code": 0, "msg": "已提交整理", "resp": resp}
         else:
             with self._lock:
                 self._queue.pop(id, None)
+            self._save_queue()
             return {"next_api": "api/v1/transfer/manual", "method": "post", "json": body}
 
     def api_selftest(self):
-        """
-        一键自检：返回结构 + 写入 self._selftest（页面刷新显示）
-        """
         logs: List[str] = []
         ok = True
         t0 = time.time()
 
         def log(s, good=None):
-            flag = "✓" if good is True else ("✗" if good is False else "•")
-            msg = f"{flag} {s}"
+            flag = "PASS" if good is True else ("FAIL" if good is False else "INFO")
+            msg = f"[{flag}] {s}"
             logs.append(msg)
             logger.info(f"[MSAIR][SELFTEST] {msg}")
 
@@ -860,7 +860,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         mp_base = self._cfg.get("mp_api_base")
         mp_tok = self._cfg.get("mp_api_token")
         if not mp_base or not mp_tok:
-            log("主程序后端直连未配置（mp_api_base/mp_api_token），跳过直连自测（前端相对路由不受影响）。")
+            log("主程序后端直连未配置（mp_api_base/mp_api_token），跳过直连自测。")
         else:
             try:
                 mp = MPClient(mp_base, mp_tok)
@@ -917,7 +917,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                     "score": {"total": 130, "items": [("demo", 130)]},
                 }
             r = self.api_confirm(iid, target_storage="local", target_path="/media/SelfTest", background=True)
-            # 如果未配置 mp 直连，会返回 next_api 让前端继续；这也算通过
             if isinstance(r, dict) and (r.get("code") == 0 or r.get("next_api")):
                 log("确认流程可用（生成 transfer/manual payload 或已提交）。", True)
             else:
@@ -934,7 +933,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
 
     # ===== 仪表板 =====
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
-        return [{"key": "queue", "name": "多源AI识别：待确认"}]
+        return [{"key": "queue", "name": "AI辅助识别：待确认"}]
 
     def get_dashboard(self, key: str, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], List[dict]]]:
         if key != "queue":
@@ -964,8 +963,8 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                                         "method": "post",
                                         "json": {
                                             "id": "{{item.id}}",
-                                            "target_storage": "local",
-                                            "target_path": "/media/Movies",
+                                            "target_storage": "",
+                                            "target_path": "",
                                         },
                                     }
                                 },
@@ -980,21 +979,14 @@ class Multisource_Ai_Recognizer(MPPluginBase):
 
     # ===== 工作流（v2.4.8+） =====
     def get_actions(self) -> List[Dict[str, Any]]:
-        return [{"id": "msair_recognize", "name": "多源AI识别评分", "func": self.action_ai_recognize, "kwargs": {}}]
+        return [{"id": "msair_recognize", "name": "AI辅助识别评分", "func": self.action_ai_recognize, "kwargs": {}}]
 
     def action_ai_recognize(self, action_content, **kwargs):
         title = getattr(action_content, "title", None) or getattr(action_content, "name", None)
         if not title:
             return False, action_content
-        llm = LLMClient(self._cfg["llm_base"], self._cfg["llm_key"], self._cfg["llm_model"])
-        system_prompt = (
-            "你是严格模式的命名解析器。只输出一个JSON对象，不得包含解释、Markdown或代码块。"
-            "字段：name, version, part, year, resolution, season, episode。"
-            "规则：year为4位数字或null；season/episode为正整数或null；其余为字符串或null。"
-            "无法解析时输出{}。示例："
-            '{"name":"xxx","year":"2024","season":1,"episode":2,"version":null,"part":null,"resolution":"1080p"}'
-        )
-        ai = llm.parse_title(title, system_prompt)
+        llm = self._make_llm_client()
+        ai = llm.parse_title(title, LLM_SYSTEM_PROMPT)
         bd = Scorer(self._cfg.get("weights") or {}).score(title, ai or {}, {})
         setattr(action_content, "ext", {"ai": ai, "score": {"total": bd.total, "items": bd.items}})
         return True, action_content
@@ -1005,7 +997,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             {
                 "cmd": "/msair",
                 "event": EventType.PluginAction,
-                "desc": "多源AI识别面板",
+                "desc": "AI辅助识别面板",
                 "category": "插件交互",
                 "data": {"action": "msair_menu"},
             }
@@ -1020,11 +1012,11 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         user = data.get("user")
         buttons = [
             [
-                {"text": "🔍 查看待确认", "callback_data": f"[PLUGIN]{self.__class__.__name__}|queue"},
-                {"text": "⚙️ 设置", "callback_data": f"[PLUGIN]{self.__class__.__name__}|settings"},
+                {"text": "查看待确认", "callback_data": f"[PLUGIN]{self.__class__.__name__}|queue"},
+                {"text": "设置", "callback_data": f"[PLUGIN]{self.__class__.__name__}|settings"},
             ]
         ]
-        self.post_message(channel=channel, title="多源AI识别", text="请选择：", userid=user, buttons=buttons)
+        self.post_message(channel=channel, title="AI辅助识别", text="请选择：", userid=user, buttons=buttons)
 
     @eventmanager.register(EventType.MessageAction)
     def message_action(self, event: Event):
@@ -1040,54 +1032,3 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             self.post_message(channel=channel, title="队列", text=f"当前待确认 {cnt} 条", userid=user)
         elif text == "settings":
             self.post_message(channel=channel, title="设置", text="请在插件页面中修改配置。", userid=user)
-
-    # ===== 存储扩展骨架（可留空） =====
-    def get_module(self) -> Dict[str, Any]:
-        return {
-            "list_files": self.list_files,
-            "any_files": self.any_files,
-            "download_file": self.download_file,
-            "upload_file": self.upload_file,
-            "delete_file": self.delete_file,
-            "rename_file": self.rename_file,
-            "get_file_item": self.get_file_item,
-            "get_parent_item": self.get_parent_item,
-            "snapshot_storage": self.snapshot_storage,
-            "storage_usage": self.storage_usage,
-            "support_transtype": self.support_transtype,
-        }
-
-    # 占位：仅当 storage=="msair" 时你再改成真实逻辑；否则返回 None
-    def list_files(self, fileitem, recursion: bool = False):
-        return None
-
-    def any_files(self, fileitem, extensions: list = None):
-        return None
-
-    def download_file(self, fileitem, path=None):
-        return None
-
-    def upload_file(self, fileitem, path, new_name: Optional[str] = None):
-        return None
-
-    def delete_file(self, fileitem):
-        return None
-
-    def rename_file(self, fileitem, name: str):
-        return None
-
-    def get_file_item(self, storage: str, path):
-        return None
-
-    def get_parent_item(self, fileitem):
-        return None
-
-    def snapshot_storage(self, storage: str, path):
-        return None
-
-    def storage_usage(self, storage: str):
-        return None
-
-    @staticmethod
-    def support_transtype(storage: str) -> Optional[dict]:
-        return {"move": "移动", "copy": "复制"}
