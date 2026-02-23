@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI 辅助识别插件 for MoviePilot v2.0.0
+AI 辅助识别插件 for MoviePilot v2.1.0
 - LLM (JSON-only) 辅助解析媒体标题，支持多服务商预设
 - 积分制评分（可>100），阈值可配
 - 智能触发AI：仅当主程序识别结果不完整时才问AI；也支持"总是/手动"
@@ -28,18 +28,7 @@ import requests
 
 # ===== MoviePilot 基础导入 =====
 from app.core.event import eventmanager, Event, EventType, ChainEventType
-try:
-    from app.core.plugin import PluginBase as MPPluginBase
-except Exception:
-    try:
-        from app.core.plugin import Plugin as MPPluginBase
-    except Exception:
-        try:
-            from app.plugins import Plugin as MPPluginBase
-        except Exception as e:
-            raise ImportError(
-                "无法导入插件基类，请升级 MoviePilot。"
-            ) from e
+from app.plugins import _PluginBase
 from app.log import logger
 from app.core.config import settings
 
@@ -79,6 +68,27 @@ LLM_PROVIDERS = {
 LLM_PROVIDER_OPTIONS = [{"title": v["name"], "value": k} for k, v in LLM_PROVIDERS.items()]
 
 _STATS_DEFAULT: Dict[str, int] = {"total_calls": 0, "success": 0, "fail": 0}
+
+_DEFAULT_CONFIG: Dict[str, Any] = {
+    "enabled": False,
+    "llm_provider": "deepseek",
+    "llm_base": "",
+    "llm_model": "",
+    "llm_key": "",
+    "llm_timeout": 30,
+    "llm_retry": 2,
+    "llm_system_prompt": "",
+    "cache_ttl": 3600,
+    "queue_max_size": 500,
+    "mp_api_base": "",
+    "mp_api_token": "",
+    "ask_mode": "smart",
+    "auto_download": False,
+    "threshold_auto": THRESHOLD_AUTO_DEFAULT,
+    "threshold_manual": THRESHOLD_MANUAL_DEFAULT,
+    "tg_bot_token": "",
+    "tg_chat_id": "",
+}
 
 
 # ========= 小工具 =========
@@ -306,7 +316,7 @@ class Scorer:
 
 
 # ========= 插件主体 =========
-class Multisource_Ai_Recognizer(MPPluginBase):
+class Multisource_Ai_Recognizer(_PluginBase):
     plugin_name = "AI辅助识别与评分"
     plugin_desc = (
         "LLM 辅助媒体标题解析；积分制评分；缓存/重试/统计；"
@@ -314,9 +324,12 @@ class Multisource_Ai_Recognizer(MPPluginBase):
     )
     plugin_icon = ("https://raw.githubusercontent.com/jxxghp/"
                    "MoviePilot-Plugins/main/icons/chatgpt.png")
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "maoxiongnet"
     plugin_order = 50
+    auth_level = 1
+
+    _enabled: bool = False
 
     # ═══════ 生命周期 ═══════
 
@@ -330,28 +343,9 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         self._stats: Dict[str, int] = {**_STATS_DEFAULT}
 
     def init_plugin(self, config: dict = None):
-        default_cfg: Dict[str, Any] = {
-            "llm_provider": "deepseek",
-            "llm_base": "",
-            "llm_model": "",
-            "llm_key": "",
-            "llm_timeout": 30,
-            "llm_retry": 2,
-            "llm_system_prompt": "",
-            "cache_ttl": 3600,
-            "queue_max_size": 500,
-            "mp_api_base": "",
-            "mp_api_token": "",
-            "ask_mode": "smart",
-            "auto_download": False,
-            "threshold_auto": THRESHOLD_AUTO_DEFAULT,
-            "threshold_manual": THRESHOLD_MANUAL_DEFAULT,
-            "weights": SCORE_WEIGHTS_DEFAULT,
-            "tg_bot_token": "",
-            "tg_chat_id": "",
-        }
+        cfg: Dict[str, Any] = {**_DEFAULT_CONFIG}
         if config:
-            default_cfg.update(config)
+            cfg.update(config)
             saved_q = config.get("_queue")
             if isinstance(saved_q, dict):
                 with self._lock:
@@ -360,10 +354,15 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             if isinstance(saved_s, dict):
                 with self._lock:
                     self._stats = {**_STATS_DEFAULT, **saved_s}
-        self._cfg = default_cfg
+        self._enabled = cfg.get("enabled", False)
+        self._cfg = cfg
+
+    def get_state(self) -> bool:
+        return self._enabled
 
     def stop_service(self):
-        self._llm_cache.clear()
+        with self._lock:
+            self._llm_cache.clear()
         self._persist()
         logger.info("[MSAIR] plugin stopped, cache cleared, state saved")
 
@@ -389,19 +388,21 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         ttl = _safe_int(self._cfg.get("cache_ttl"), 3600)
         now = time.time()
 
-        if ttl > 0 and cache_key in self._llm_cache:
-            ts, cached = self._llm_cache[cache_key]
-            if now - ts < ttl:
-                logger.debug(f"[MSAIR] cache hit: {title}")
-                return cached
+        with self._lock:
+            if ttl > 0 and cache_key in self._llm_cache:
+                ts, cached = self._llm_cache[cache_key]
+                if now - ts < ttl:
+                    logger.debug(f"[MSAIR] cache hit: {title}")
+                    return cached
 
         llm = self._make_llm_client()
         retries = _safe_int(self._cfg.get("llm_retry"), 2)
         result = llm.parse_title(title, self._get_system_prompt(),
                                  max_retries=retries)
 
-        if ttl > 0:
-            self._llm_cache[cache_key] = (now, result)
+        with self._lock:
+            if ttl > 0:
+                self._llm_cache[cache_key] = (now, result)
 
         ok = result is not None and bool((result or {}).get("name"))
         self._update_stats(ok)
@@ -496,146 +497,272 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                 ext["is_movie"] = True
         return ext
 
-    # ═══════ 配置页 ═══════
+    # ═══════ 配置表单 (get_form) ═══════
 
-    def get_setting(self) -> Optional[dict]:
-        return {
-            "element": "v-container",
-            "props": {"fluid": True},
-            "children": [
-                # Row 1: LLM 基础 + 行为
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12, "md": 6},
-                     "children": [
-                         {"element": "v-select", "props": {
-                             "label": "LLM 服务商", "model": "llm_provider",
-                             "items": LLM_PROVIDER_OPTIONS,
-                             "hint": "选择后自动填充 Base URL 和 Model",
-                             "persistent-hint": True}},
-                         {"element": "v-text-field", "props": {
-                             "label": "LLM API Key", "model": "llm_key",
-                             "type": "password"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "Base URL（留空使用服务商预设）",
-                             "model": "llm_base",
-                             "placeholder": "留空 = 使用预设地址"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "Model（留空使用服务商预设）",
-                             "model": "llm_model",
-                             "placeholder": "留空 = 使用预设模型"}},
-                     ]},
-                    {"element": "v-col", "props": {"cols": 12, "md": 6},
-                     "children": [
-                         {"element": "v-select", "props": {
-                             "label": "AI触发模式", "model": "ask_mode",
-                             "items": [
-                                 {"title": "智能(smart)", "value": "smart"},
-                                 {"title": "总是(always)", "value": "always"},
-                                 {"title": "手动(manual)", "value": "manual"},
-                             ]}},
-                         {"element": "v-switch", "props": {
-                             "label": "自动下载（>=自动阈值）",
-                             "model": "auto_download"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "自动通过阈值",
-                             "model": "threshold_auto", "type": "number"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "人工队列阈值（下限）",
-                             "model": "threshold_manual", "type": "number"}},
-                     ]},
-                ]},
-                # Row 2: 高级 + 通知
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12, "md": 6},
-                     "children": [
-                         {"element": "v-text-field", "props": {
-                             "label": "LLM 超时（秒）",
-                             "model": "llm_timeout", "type": "number",
-                             "hint": "默认 30", "persistent-hint": True}},
-                         {"element": "v-text-field", "props": {
-                             "label": "LLM 失败重试次数",
-                             "model": "llm_retry", "type": "number",
-                             "hint": "0=不重试，默认 2",
-                             "persistent-hint": True}},
-                         {"element": "v-text-field", "props": {
-                             "label": "缓存有效期（秒）",
-                             "model": "cache_ttl", "type": "number",
-                             "hint": "0=禁用缓存，默认 3600",
-                             "persistent-hint": True}},
-                         {"element": "v-text-field", "props": {
-                             "label": "队列容量上限",
-                             "model": "queue_max_size", "type": "number",
-                             "hint": "0=不限，默认 500",
-                             "persistent-hint": True}},
-                     ]},
-                    {"element": "v-col", "props": {"cols": 12, "md": 6},
-                     "children": [
-                         {"element": "v-text-field", "props": {
-                             "label": "MoviePilot API 地址（可选）",
-                             "model": "mp_api_base",
-                             "placeholder": "http://localhost:3000"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "MoviePilot API Token（可选）",
-                             "model": "mp_api_token", "type": "password"}},
-                         {"element": "v-text-field", "props": {
-                             "label": "Telegram Bot Token（独立通知）",
-                             "model": "tg_bot_token", "type": "password",
-                             "hint": "留空则不发 Telegram",
-                             "persistent-hint": True}},
-                         {"element": "v-text-field", "props": {
-                             "label": "Telegram Chat ID",
-                             "model": "tg_chat_id",
-                             "hint": "群组/频道/个人 Chat ID",
-                             "persistent-hint": True}},
-                     ]},
-                ]},
-                # Row 3: System Prompt
-                {"element": "v-row", "children": [
-                    {"element": "v-col", "props": {"cols": 12},
-                     "children": [
-                         {"element": "v-textarea", "props": {
-                             "label": "自定义 System Prompt（留空使用默认）",
-                             "model": "llm_system_prompt",
-                             "rows": 3, "auto-grow": True,
-                             "placeholder": LLM_SYSTEM_PROMPT_DEFAULT}},
-                     ]},
-                ]},
-                # Info
-                {"element": "v-alert",
-                 "props": {"type": "info", "text": True},
-                 "children": [
-                     "打分：AI贡献/标题相似度/年份/季集匹配；分数可>100。"
-                     "推荐阈值：自动>=120；人工80-119；<80交由主程序处理。"
-                 ]},
-            ],
-        }
-
-    def get_state(self) -> Optional[dict]:
-        with self._lock:
-            return {**self._cfg,
-                    "_queue": copy.deepcopy(self._queue),
-                    "_stats": copy.deepcopy(self._stats)}
-
-    def set_state(self, state: dict):
-        if not state:
-            return
-        saved_q = state.get("_queue")
-        saved_s = state.get("_stats")
-        cfg = {k: v for k, v in state.items()
-               if k not in ("_queue", "_stats")}
-        self._cfg.update(cfg)
-        if isinstance(saved_q, dict):
-            with self._lock:
-                self._queue = saved_q
-        if isinstance(saved_s, dict):
-            with self._lock:
-                self._stats = {**_STATS_DEFAULT, **saved_s}
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    # Row 0: 启用开关
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_download",
+                                            "label": "自动下载（>=自动阈值）",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    # Row 1: LLM 基础 + 行为
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "llm_provider",
+                                            "label": "LLM 服务商",
+                                            "items": LLM_PROVIDER_OPTIONS,
+                                            "hint": "选择后自动填充 Base URL 和 Model",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "llm_key",
+                                            "label": "LLM API Key",
+                                            "type": "password",
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "llm_base",
+                                            "label": "Base URL（留空使用服务商预设）",
+                                            "placeholder": "留空 = 使用预设地址",
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "llm_model",
+                                            "label": "Model（留空使用服务商预设）",
+                                            "placeholder": "留空 = 使用预设模型",
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "ask_mode",
+                                            "label": "AI触发模式",
+                                            "items": [
+                                                {"title": "智能(smart)", "value": "smart"},
+                                                {"title": "总是(always)", "value": "always"},
+                                                {"title": "手动(manual)", "value": "manual"},
+                                            ],
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "threshold_auto",
+                                            "label": "自动通过阈值",
+                                            "type": "number",
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "threshold_manual",
+                                            "label": "人工队列阈值（下限）",
+                                            "type": "number",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # Row 2: 高级 + 通知
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "llm_timeout",
+                                            "label": "LLM 超时（秒）",
+                                            "type": "number",
+                                            "hint": "默认 30",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "llm_retry",
+                                            "label": "LLM 失败重试次数",
+                                            "type": "number",
+                                            "hint": "0=不重试，默认 2",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cache_ttl",
+                                            "label": "缓存有效期（秒）",
+                                            "type": "number",
+                                            "hint": "0=禁用缓存，默认 3600",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "queue_max_size",
+                                            "label": "队列容量上限",
+                                            "type": "number",
+                                            "hint": "0=不限，默认 500",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mp_api_base",
+                                            "label": "MoviePilot API 地址（可选）",
+                                            "placeholder": "http://localhost:3000",
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mp_api_token",
+                                            "label": "MoviePilot API Token（可选）",
+                                            "type": "password",
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "tg_bot_token",
+                                            "label": "Telegram Bot Token（独立通知）",
+                                            "type": "password",
+                                            "hint": "留空则不发 Telegram",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "tg_chat_id",
+                                            "label": "Telegram Chat ID",
+                                            "hint": "群组/频道/个人 Chat ID",
+                                            "persistent-hint": True,
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    # Row 3: System Prompt
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "llm_system_prompt",
+                                            "label": "自定义 System Prompt（留空使用默认）",
+                                            "rows": 3,
+                                            "auto-grow": True,
+                                            "placeholder": LLM_SYSTEM_PROMPT_DEFAULT,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    # Info alert
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": (
+                                                "打分：AI贡献/标题相似度/年份/季集匹配；分数可>100。"
+                                                "推荐阈值：自动>=120；人工80-119；<80交由主程序处理。"
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ], {**_DEFAULT_CONFIG}
 
     # ═══════ NameRecognize 事件 ═══════
 
     @eventmanager.register(ChainEventType.NameRecognize)
     def on_name_recognize(self, event: Event):
-        if not self.is_enabled:
+        if not self._enabled:
             return
         data = getattr(event, "event_data", None)
         if not data:
@@ -651,6 +778,9 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             logger.debug(f"[MSAIR] smart skip: '{data.name}'")
             return
 
+        # [FIX] 在 AI 写入之前提取原始外部信息，避免评分自比较
+        ext = self._build_ext(data)
+
         ai = self._llm_parse_cached(title)
         if not ai or not ai.get("name"):
             logger.debug(f"[MSAIR] LLM empty for: {title}")
@@ -660,6 +790,8 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         ai_year = ai.get("year")
         ai_season = _safe_int(ai.get("season"))
         ai_episode = _safe_int(ai.get("episode"))
+
+        # 将 AI 结果回写到 event_data
         if ai_name:
             data.name = str(ai_name)
         if ai_year:
@@ -672,7 +804,6 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         logger.info(f"[MSAIR] AI: name={ai_name}, year={ai_year}, "
                      f"S{ai_season}E{ai_episode} | {title}")
 
-        ext = self._build_ext(data)
         scorer = Scorer(self._cfg.get("weights") or {})
         bd = scorer.score(ai, ext)
         total = bd.total
@@ -730,7 +861,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
 
     # ═══════ 管理页面 ═══════
 
-    def get_page(self) -> Optional[dict]:
+    def get_page(self) -> List[dict]:
         with self._lock:
             rows = [
                 {"id": k, "title": v.get("title"),
@@ -741,147 +872,193 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             ]
             q_cnt = len(self._queue)
             stats = {**self._stats}
+            cache_cnt = len(self._llm_cache)
 
         tc = stats.get("total_calls", 0)
         succ = stats.get("success", 0)
         fail = stats.get("fail", 0)
         rate = round(succ / tc * 100, 1) if tc > 0 else 0
 
-        stats_card = {
-            "element": "v-alert",
-            "props": {"type": "info", "text": True, "class": "mb-4"},
-            "children": [
-                f"LLM 调用: {tc} | 成功: {succ} | 失败: {fail} | "
-                f"成功率: {rate}% | 队列: {q_cnt} 条 | "
-                f"缓存: {len(self._llm_cache)} 条"
-            ]}
+        stats_text = (
+            f"LLM 调用: {tc} | 成功: {succ} | 失败: {fail} | "
+            f"成功率: {rate}% | 队列: {q_cnt} 条 | "
+            f"缓存: {cache_cnt} 条"
+        )
 
-        top_btns = {
-            "element": "v-row", "children": [
-                {"element": "v-col",
-                 "props": {"cols": 12, "md": 8},
-                 "children": [
-                     {"element": "v-btn",
-                      "props": {"color": "primary", "class": "mr-2"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/ai_batch",
-                          "method": "post",
-                          "json": {"scope": "all"}}},
-                      "children": ["AI识别（全部）"]},
-                     {"element": "v-btn",
-                      "props": {"color": "primary", "class": "mr-2"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/ai_batch",
-                          "method": "post",
-                          "json": {"scope": "selected",
-                                   "ids": "{{selectedIds}}"}}},
-                      "children": ["AI识别（所选）"]},
-                     {"element": "v-btn",
-                      "props": {"color": "error", "class": "mr-2"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/queue_clear",
-                          "method": "post"}},
-                      "children": ["清空队列"]},
-                     {"element": "v-btn",
-                      "props": {"color": "warning", "class": "mr-2"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/stats_reset",
-                          "method": "post"}},
-                      "children": ["重置统计"]},
-                     {"element": "v-btn",
-                      "props": {"color": "secondary"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/selftest",
-                          "method": "post"}},
-                      "children": ["自检"]},
-                 ]},
-                {"element": "v-col",
-                 "props": {"cols": 12, "md": 4},
-                 "children": [
-                     {"element": "v-select", "props": {
-                         "label": "AI触发模式", "model": "ask_mode",
-                         "items": [
-                             {"title": "智能(smart)", "value": "smart"},
-                             {"title": "总是(always)", "value": "always"},
-                             {"title": "手动(manual)", "value": "manual"}],
-                         "value": self._cfg.get("ask_mode", "smart")},
-                      "events": {"change": {
-                          "api": "plugin/multisource_ai_recognizer/config",
-                          "method": "post",
-                          "json": {"ask_mode": "{{ask_mode}}"}}}}
-                 ]},
-            ]}
+        children = [
+            # 统计信息
+            {
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "class": "mb-4", "text": stats_text},
+            },
+            # 操作按钮行
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 8},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {"color": "primary",
+                                          "class": "mr-2"},
+                                "events": {"click": {
+                                    "api": "plugin/Multisource_Ai_Recognizer/ai_batch",
+                                    "method": "post",
+                                    "json": {"scope": "all"}}},
+                                "text": "AI识别（全部）",
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {"color": "error",
+                                          "class": "mr-2"},
+                                "events": {"click": {
+                                    "api": "plugin/Multisource_Ai_Recognizer/queue_clear",
+                                    "method": "post"}},
+                                "text": "清空队列",
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {"color": "warning",
+                                          "class": "mr-2"},
+                                "events": {"click": {
+                                    "api": "plugin/Multisource_Ai_Recognizer/stats_reset",
+                                    "method": "post"}},
+                                "text": "重置统计",
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {"color": "secondary"},
+                                "events": {"click": {
+                                    "api": "plugin/Multisource_Ai_Recognizer/selftest",
+                                    "method": "post"}},
+                                "text": "自检",
+                            },
+                        ],
+                    },
+                ],
+            },
+            # 目标路径输入
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 4},
+                        "content": [{
+                            "component": "VTextField",
+                            "props": {
+                                "model": "target_storage",
+                                "label": "目标存储类型",
+                                "placeholder": "local/nas/...",
+                            },
+                        }],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 8},
+                        "content": [{
+                            "component": "VTextField",
+                            "props": {
+                                "model": "target_path",
+                                "label": "目标目录路径",
+                                "placeholder": "/media/Movies",
+                            },
+                        }],
+                    },
+                ],
+            },
+        ]
 
-        target_inputs = {
-            "element": "v-row", "children": [
-                {"element": "v-col", "props": {"cols": 12, "md": 4},
-                 "children": [{"element": "v-text-field", "props": {
-                     "label": "目标存储类型", "model": "target_storage",
-                     "placeholder": "local/nas/..."}}]},
-                {"element": "v-col", "props": {"cols": 12, "md": 8},
-                 "children": [{"element": "v-text-field", "props": {
-                     "label": "目标目录路径", "model": "target_path",
-                     "placeholder": "/media/Movies"}}]},
-            ]}
+        # 队列列表（使用 VCard 逐条展示）
+        if rows:
+            row_cards = []
+            for r in rows:
+                row_cards.append({
+                    "component": "VCard",
+                    "props": {"class": "mb-2 pa-3", "variant": "outlined"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "props": {"class": "text-subtitle-1"},
+                            "text": f"{r.get('name') or '未识别'}"
+                                    f" ({r.get('year') or '?'})"
+                                    f"  [得分: {r.get('score', 0)}]",
+                        },
+                        {
+                            "component": "VCardSubtitle",
+                            "text": f"原标题: {r.get('title', '')}",
+                        },
+                        {
+                            "component": "VCardText",
+                            "text": f"ID: {r.get('id', '')}",
+                        },
+                    ],
+                })
+            children.append({
+                "component": "VRow",
+                "content": [{
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": row_cards,
+                }],
+            })
+        else:
+            children.append({
+                "component": "VRow",
+                "content": [{
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [{
+                        "component": "VAlert",
+                        "props": {
+                            "type": "success",
+                            "variant": "tonal",
+                            "text": "队列为空，暂无待确认条目。",
+                        },
+                    }],
+                }],
+            })
 
-        table = {
-            "element": "v-data-table",
-            "props": {
-                "items": rows, "show-select": True,
-                "model": "selectedIds",
-                "headers": [
-                    {"title": "ID", "value": "id"},
-                    {"title": "标题", "value": "title"},
-                    {"title": "名称", "value": "name"},
-                    {"title": "年份", "value": "year"},
-                    {"title": "得分", "value": "score"},
-                    {"title": "操作", "value": "actions"}],
-                "item": {"actions": {
-                    "element": "div", "children": [
-                        {"element": "v-btn",
-                         "props": {"text": True, "color": "primary",
-                                   "size": "small", "class": "mr-1"},
-                         "events": {"click": {
-                             "api": "plugin/multisource_ai_recognizer/confirm",
-                             "method": "post",
-                             "json": {"id": "{{item.id}}",
-                                      "target_storage": "{{target_storage}}",
-                                      "target_path": "{{target_path}}"}}},
-                         "children": ["确认"]},
-                        {"element": "v-btn",
-                         "props": {"text": True, "color": "error",
-                                   "size": "small"},
-                         "events": {"click": {
-                             "api": "plugin/multisource_ai_recognizer/queue_delete",
-                             "method": "post",
-                             "json": {"id": "{{item.id}}"}}},
-                         "children": ["删除"]}]}}}}
-
-        children = [stats_card, top_btns, target_inputs, table]
-
+        # 自检结果
         if self._selftest:
             ok_flag = bool(self._selftest.get("ok"))
             logs_list = self._selftest.get("logs") or []
             txt = "\n".join(logs_list) if logs_list else "（无日志）"
             children.append({
-                "element": "v-alert",
-                "props": {"type": "success" if ok_flag else "error",
-                          "text": True},
-                "children": [
-                    "自检结果：" + ("通过" if ok_flag else "存在问题")]})
+                "component": "VAlert",
+                "props": {
+                    "type": "success" if ok_flag else "error",
+                    "variant": "tonal",
+                    "text": "自检结果：" + ("通过" if ok_flag else "存在问题"),
+                },
+            })
             children.append({
-                "element": "v-card", "children": [
-                    {"element": "v-card-title",
-                     "children": ["自检日志"]},
-                    {"element": "v-card-text",
-                     "children": [txt]}]})
+                "component": "VCard",
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "text": "自检日志",
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"style": "white-space: pre-wrap;"},
+                        "text": txt,
+                    },
+                ],
+            })
 
-        return {"element": "v-container", "props": {"fluid": True},
-                "children": children}
+        return [{
+            "component": "VContainer",
+            "props": {"fluid": True},
+            "content": children,
+        }]
 
     # ═══════ API 端点 ═══════
 
-    def get_api(self) -> Optional[List[dict]]:
+    def get_api(self) -> List[dict]:
         return [
             {"path": "/queue", "endpoint": self.api_queue,
              "methods": ["GET"], "summary": "获取人工队列"},
@@ -933,10 +1110,17 @@ class Multisource_Ai_Recognizer(MPPluginBase):
         return {"code": 0, "msg": "ok", "changed": changed}
 
     def api_ai_batch(self, apikey: str = "", scope: str = "all",
-                     ids: Optional[List[str]] = None):
+                     ids=None):
         err = self._check_api_token(apikey)
         if err:
             return err
+
+        # ids 可能是 list 或逗号分隔字符串
+        if isinstance(ids, str):
+            ids = [i.strip() for i in ids.split(",") if i.strip()]
+        elif not isinstance(ids, list):
+            ids = []
+
         cnt = 0
         with self._lock:
             if scope == "selected" and ids:
@@ -1045,11 +1229,13 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             return err
         with self._lock:
             s = {**self._stats}
+            cache_size = len(self._llm_cache)
+            queue_size = len(self._queue)
         tc = s.get("total_calls", 0)
         s["rate"] = round(s.get("success", 0) / tc * 100, 1) \
             if tc > 0 else 0
-        s["cache_size"] = len(self._llm_cache)
-        s["queue_size"] = len(self._queue)
+        s["cache_size"] = cache_size
+        s["queue_size"] = queue_size
         return {"code": 0, "data": s}
 
     def api_stats_reset(self, apikey: str = ""):
@@ -1058,7 +1244,7 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             return err
         with self._lock:
             self._stats = {**_STATS_DEFAULT}
-        self._llm_cache.clear()
+            self._llm_cache.clear()
         self._persist()
         return {"code": 0, "msg": "stats and cache reset"}
 
@@ -1176,10 +1362,15 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             ok = False
 
         # 统计/缓存
-        log(f"缓存 {len(self._llm_cache)} 条，"
-            f"统计 total={self._stats.get('total_calls', 0)}/"
-            f"ok={self._stats.get('success', 0)}/"
-            f"fail={self._stats.get('fail', 0)}。")
+        with self._lock:
+            cache_cnt = len(self._llm_cache)
+            stat_total = self._stats.get("total_calls", 0)
+            stat_ok = self._stats.get("success", 0)
+            stat_fail = self._stats.get("fail", 0)
+        log(f"缓存 {cache_cnt} 条，"
+            f"统计 total={stat_total}/"
+            f"ok={stat_ok}/"
+            f"fail={stat_fail}。")
 
         cost = round((time.time() - t0) * 1000)
         log(f"自检完成，用时 {cost} ms。")
@@ -1203,25 +1394,29 @@ class Multisource_Ai_Recognizer(MPPluginBase):
             conf = {"refresh": 30, "title": "AI识别统计"}
             with self._lock:
                 s = {**self._stats}
+                cache_cnt = len(self._llm_cache)
             tc = s.get("total_calls", 0)
             succ = s.get("success", 0)
             fail = s.get("fail", 0)
             rate = round(succ / tc * 100, 1) if tc > 0 else 0
-            page = [{"element": "v-card",
-                     "props": {"class": "pa-4"},
-                     "children": [
-                         {"element": "div",
-                          "children": [f"总调用: {tc}"]},
-                         {"element": "div",
-                          "children": [f"成功: {succ}"]},
-                         {"element": "div",
-                          "children": [f"失败: {fail}"]},
-                         {"element": "div",
-                          "children": [f"成功率: {rate}%"]},
-                         {"element": "div",
-                          "children": [
-                              f"缓存: {len(self._llm_cache)} 条"]},
-                     ]}]
+            page = [
+                {
+                    "component": "VCard",
+                    "props": {"class": "pa-4"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "text": (
+                                f"总调用: {tc}\n"
+                                f"成功: {succ}\n"
+                                f"失败: {fail}\n"
+                                f"成功率: {rate}%\n"
+                                f"缓存: {cache_cnt} 条"
+                            ),
+                        }
+                    ],
+                }
+            ]
             return cols, conf, page
 
         if key == "queue":
@@ -1232,21 +1427,26 @@ class Multisource_Ai_Recognizer(MPPluginBase):
                     {"id": k, "title": v.get("title"),
                      "score": (v.get("score") or {}).get("total", 0)}
                     for k, v in list(self._queue.items())[:6]]
-            page = [{"element": "v-list", "children": [
-                {"element": "v-list-item",
-                 "props": {"title": "{{item.title}}",
-                           "subtitle": "分数：{{item.score}}"},
-                 "for": {"item": top},
-                 "children": [
-                     {"element": "v-btn",
-                      "props": {"text": True, "size": "small"},
-                      "events": {"click": {
-                          "api": "plugin/multisource_ai_recognizer/confirm",
-                          "method": "post",
-                          "json": {"id": "{{item.id}}",
-                                   "target_storage": "",
-                                   "target_path": ""}}},
-                      "children": ["快速确认"]}]}]}]
+            if not top:
+                page = [{
+                    "component": "VAlert",
+                    "props": {"type": "success", "variant": "tonal",
+                              "text": "队列为空"},
+                }]
+            else:
+                items = []
+                for item in top:
+                    items.append({
+                        "component": "VListItem",
+                        "props": {
+                            "title": item.get("title") or "未知",
+                            "subtitle": f"分数：{item.get('score', 0)}",
+                        },
+                    })
+                page = [{
+                    "component": "VList",
+                    "content": items,
+                }]
             return cols, conf, page
 
         return None
@@ -1282,6 +1482,8 @@ class Multisource_Ai_Recognizer(MPPluginBase):
 
     @eventmanager.register(EventType.PluginAction)
     def command_action(self, event: Event):
+        if not self._enabled:
+            return
         data = getattr(event, "event_data", {}) or {}
         if data.get("action") != "msair_menu":
             return
@@ -1301,6 +1503,8 @@ class Multisource_Ai_Recognizer(MPPluginBase):
 
     @eventmanager.register(EventType.MessageAction)
     def message_action(self, event: Event):
+        if not self._enabled:
+            return
         data = getattr(event, "event_data", {}) or {}
         if data.get("plugin_id") != self.__class__.__name__:
             return
