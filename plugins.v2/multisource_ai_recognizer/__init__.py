@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI 辅助识别插件 for MoviePilot v2.1.0
+AI 辅助识别插件 for MoviePilot v2.1.1
 - LLM (JSON-only) 辅助解析媒体标题，支持多服务商预设
 - 积分制评分（可>100），阈值可配
 - 智能触发AI：仅当主程序识别结果不完整时才问AI；也支持"总是/手动"
@@ -324,7 +324,7 @@ class Multisource_Ai_Recognizer(_PluginBase):
     )
     plugin_icon = ("https://raw.githubusercontent.com/jxxghp/"
                    "MoviePilot-Plugins/main/icons/chatgpt.png")
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     plugin_author = "maoxiongnet"
     plugin_order = 50
     auth_level = 1
@@ -466,29 +466,44 @@ class Multisource_Ai_Recognizer(_PluginBase):
             logger.debug(f"[MSAIR] telegram notify failed: {e}")
 
     @staticmethod
-    def _build_ext(data) -> Dict[str, Any]:
+    def _get_val(data, key, default=None):
+        """兼容 dict 和 object 两种 event_data 类型"""
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
+
+    @staticmethod
+    def _set_val(data, key, value):
+        """兼容 dict 和 object 两种 event_data 类型"""
+        if isinstance(data, dict):
+            data[key] = value
+        else:
+            setattr(data, key, value)
+
+    @classmethod
+    def _build_ext(cls, data) -> Dict[str, Any]:
         ext: Dict[str, Any] = {}
         for attr in ("tmdbid", "doubanid", "bangumiid",
                      "traktid", "imdbid"):
-            val = getattr(data, attr, None)
+            val = cls._get_val(data, attr)
             if val:
                 ext[attr] = val
-        existing_name = getattr(data, "name", None)
+        existing_name = cls._get_val(data, "name")
         if existing_name:
             ext["names"] = [existing_name]
-        existing_year = getattr(data, "year", None)
+        existing_year = cls._get_val(data, "year")
         if existing_year:
             ext["year"] = str(existing_year)
-        s = _safe_int(getattr(data, "season", None))
-        ep = _safe_int(getattr(data, "episode", None))
+        s = _safe_int(cls._get_val(data, "season"))
+        ep = _safe_int(cls._get_val(data, "episode"))
         if s is not None or ep is not None:
             ext["se"] = {}
             if s is not None:
                 ext["se"]["season"] = s
             if ep is not None:
                 ext["se"]["episode"] = ep
-        mtype = (getattr(data, "type", None)
-                 or getattr(data, "media_type", None))
+        mtype = (cls._get_val(data, "type")
+                 or cls._get_val(data, "media_type"))
         if mtype:
             ms = str(mtype).lower()
             if "anime" in ms or "动漫" in ms:
@@ -767,18 +782,20 @@ class Multisource_Ai_Recognizer(_PluginBase):
         data = getattr(event, "event_data", None)
         if not data:
             return
-        title: str = getattr(data, "title", "") or ""
+        # event_data 是 dict（MoviePilot 用 {'title': title} 发送）
+        title: str = self._get_val(data, "title", "") or ""
         if not title.strip():
             return
 
         mode = self._cfg.get("ask_mode", "smart")
         if mode == "manual":
             return
-        if mode == "smart" and getattr(data, "name", None):
-            logger.debug(f"[MSAIR] smart skip: '{data.name}'")
+        existing_name = self._get_val(data, "name")
+        if mode == "smart" and existing_name:
+            logger.debug(f"[MSAIR] smart skip: '{existing_name}'")
             return
 
-        # [FIX] 在 AI 写入之前提取原始外部信息，避免评分自比较
+        # 在 AI 写入之前提取原始外部信息，避免评分自比较
         ext = self._build_ext(data)
 
         ai = self._llm_parse_cached(title)
@@ -791,15 +808,15 @@ class Multisource_Ai_Recognizer(_PluginBase):
         ai_season = _safe_int(ai.get("season"))
         ai_episode = _safe_int(ai.get("episode"))
 
-        # 将 AI 结果回写到 event_data
+        # 将 AI 结果回写到 event_data（兼容 dict 和 object）
         if ai_name:
-            data.name = str(ai_name)
+            self._set_val(data, "name", str(ai_name))
         if ai_year:
-            data.year = str(ai_year)
+            self._set_val(data, "year", str(ai_year))
         if ai_season is not None:
-            data.season = ai_season
+            self._set_val(data, "season", ai_season)
         if ai_episode is not None:
-            data.episode = ai_episode
+            self._set_val(data, "episode", ai_episode)
 
         logger.info(f"[MSAIR] AI: name={ai_name}, year={ai_year}, "
                      f"S{ai_season}E{ai_episode} | {title}")
